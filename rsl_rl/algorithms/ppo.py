@@ -50,6 +50,7 @@ class PPO:
         mixed_precision: bool = False,
         entropy_coef: float = 0.01,
         learning_rate: float = 0.001,
+        critic_learning_rate: float | None = None,
         max_grad_norm: float = 1.0,
         optimizer: str = "adam",
         use_clipped_value_loss: bool = True,
@@ -96,9 +97,20 @@ class PPO:
         self._raw_actor = self.actor
         self._raw_critic = self.critic
 
-        # Create the optimizer
+        # Create the optimizer. The critic gets its own parameter group so that a
+        # fixed critic_learning_rate can be held constant while the actor's rate
+        # follows the adaptive KL schedule, as an asymmetric central critic does.
+        self.critic_learning_rate = critic_learning_rate
         self.optimizer = resolve_optimizer(optimizer)(
-            chain(self.actor.parameters(), self.critic.parameters()), lr=learning_rate
+            [
+                {"params": list(self.actor.parameters()), "name": "actor"},
+                {
+                    "params": list(self.critic.parameters()),
+                    "name": "critic",
+                    "lr": learning_rate if critic_learning_rate is None else critic_learning_rate,
+                },
+            ],
+            lr=learning_rate,
         )  # type: ignore
 
         # Add storage
@@ -293,8 +305,11 @@ class PPO:
                         torch.distributed.broadcast(lr_tensor, src=0)
                         self.learning_rate = lr_tensor.item()
 
-                    # Update the learning rate for all parameter groups
+                    # Update the learning rate for all parameter groups, leaving a
+                    # pinned critic group alone.
                     for param_group in self.optimizer.param_groups:
+                        if self.critic_learning_rate is not None and param_group.get("name") == "critic":
+                            continue
                         param_group["lr"] = self.learning_rate
 
             # Surrogate loss
