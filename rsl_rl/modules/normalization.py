@@ -12,6 +12,37 @@ import torch
 from torch import nn
 
 
+class RunningMeanStd(nn.Module):
+    """Value normalization used by rl_games."""
+
+    def __init__(self, shape: int | tuple[int, ...], eps: float = 1e-5) -> None:
+        super().__init__()
+        self.eps = eps
+        self.register_buffer("mean", torch.zeros(shape, dtype=torch.float64))
+        self.register_buffer("var", torch.ones(shape, dtype=torch.float64))
+        self.register_buffer("count", torch.ones((), dtype=torch.float64))
+
+    @torch.no_grad()
+    def update(self, values: torch.Tensor) -> None:
+        batch_count = values.shape[0]
+        batch_mean = values.mean(0).double()
+        batch_var = values.var(0).double()
+        delta = batch_mean - self.mean
+        total = self.count + batch_count
+        m2 = self.var * self.count + batch_var * batch_count
+        m2 += delta.square() * self.count * batch_count / total
+        self.mean += delta * batch_count / total
+        self.var = m2 / total
+        self.count = total
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        return ((values - self.mean.float()) / torch.sqrt(self.var.float() + self.eps)).clamp(-5, 5)
+
+    @torch.no_grad()
+    def inverse(self, values: torch.Tensor) -> torch.Tensor:
+        return values.clamp(-5, 5) * torch.sqrt(self.var.float() + self.eps) + self.mean.float()
+
+
 class EmpiricalNormalization(nn.Module):
     """Normalize mean and variance of values based on empirical values."""
 

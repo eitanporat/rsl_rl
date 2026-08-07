@@ -16,6 +16,41 @@ from rsl_rl.modules.distribution import Distribution
 from rsl_rl.utils import resolve_callable, unpad_trajectories
 
 
+class _CoefficientEmbedding(nn.Module):
+    def __init__(self, values: torch.Tensor, size: int, index: int) -> None:
+        super().__init__()
+        self.index = index
+        self.register_buffer("values", values.detach().clone().flatten())
+        self.embedding = nn.Parameter(torch.randn(self.values.numel(), size))
+
+    def split(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        coefficient = obs[..., self.index]
+        base = torch.cat((obs[..., : self.index], obs[..., self.index + 1 :]), -1)
+        indices = (coefficient[..., None] == self.values).long().argmax(-1)
+        return base, self.embedding[indices]
+
+    def insert(self, obs: torch.Tensor, embedding: torch.Tensor) -> torch.Tensor:
+        return torch.cat((obs[..., : self.index], embedding, obs[..., self.index :]), -1)
+
+
+class _ExportObservationEncoder(nn.Module):
+    def __init__(self, model: MLPModel) -> None:
+        super().__init__()
+        self.normalizer = copy.deepcopy(model.obs_normalizer)
+        self.enabled = model.coefficient_embedding is not None
+        self.embedding = (
+            copy.deepcopy(model.coefficient_embedding)
+            if model.coefficient_embedding is not None
+            else _CoefficientEmbedding(torch.zeros(1), 0, 0)
+        )
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        if not self.enabled:
+            return self.normalizer(obs)
+        obs, embedding = self.embedding.split(obs)
+        return self.embedding.insert(self.normalizer(obs), embedding)
+
+
 class MLPModel(nn.Module):
     """MLP-based neural model.
 
@@ -37,6 +72,8 @@ class MLPModel(nn.Module):
         activation: str = "elu",
         obs_normalization: bool = False,
         distribution_cfg: dict | None = None,
+        aux_value: bool = False,
+        coefficient_embedding_cfg: dict | None = None,
     ) -> None:
         """Initialize the MLP-based model.
 
@@ -50,20 +87,36 @@ class MLPModel(nn.Module):
             obs_normalization: Whether to normalize the observations before feeding them to the MLP.
             distribution_cfg: Configuration dictionary for the output distribution. If provided, the model outputs
                 stochastic values sampled from the distribution.
+            aux_value: Whether to add a value head sharing the model trunk.
+            coefficient_embedding_cfg: Learned scalar-coefficient embedding configuration.
         """
         super().__init__()
 
         # Resolve observation groups and dimensions
         self.obs_groups, self.obs_dim = self._get_obs_dim(obs, obs_groups, obs_set)
+        if coefficient_embedding_cfg is not None:
+            cfg = dict(coefficient_embedding_cfg)
+            group = cfg.pop("condition_group")
+            index = cfg.pop("condition_index", -1) % obs[group].shape[-1]
+            offset = sum(obs[name].shape[-1] for name in self.obs_groups[: self.obs_groups.index(group)])
+            self.coefficient_embedding = _CoefficientEmbedding(
+                torch.unique(obs[group][..., index]), cfg.pop("embedding_dim"), offset + index
+            )
+        else:
+            self.coefficient_embedding = None
+        self.input_dim = self.obs_dim - (self.coefficient_embedding is not None)
+        if self.coefficient_embedding is not None:
+            self.input_dim += self.coefficient_embedding.embedding.shape[-1]
 
         # Observation normalization
         self.obs_normalization = obs_normalization
         distribution_cfg = dict(distribution_cfg) if distribution_cfg is not None else None
         self.extra_info_dim = distribution_cfg.pop("extra_info_dim", 0) if distribution_cfg else 0
         if obs_normalization:
+            normalized_dim = self.obs_dim - (1 if self.coefficient_embedding is not None else self.extra_info_dim)
             self.obs_normalizer = EmpiricalNormalization(
-                self.obs_dim - self.extra_info_dim,
-                unnormalized_tail_dim=self.extra_info_dim,
+                normalized_dim,
+                unnormalized_tail_dim=0 if self.coefficient_embedding is not None else self.extra_info_dim,
             )
         else:
             self.obs_normalizer = torch.nn.Identity()
@@ -73,9 +126,7 @@ class MLPModel(nn.Module):
             condition_group = distribution_cfg.get("condition_group")
             if condition_group is not None:
                 condition_index = distribution_cfg.get("condition_index", -1)
-                distribution_cfg["condition_values"] = torch.unique(
-                    obs[condition_group][..., condition_index]
-                ).detach()
+                distribution_cfg["condition_values"] = torch.unique(obs[condition_group][..., condition_index]).detach()
             dist_class: type[Distribution] = resolve_callable(distribution_cfg.pop("class_name"))  # type: ignore
             self.distribution: Distribution | None = dist_class(output_dim, **distribution_cfg)
             mlp_output_dim = self.distribution.input_dim
@@ -85,6 +136,8 @@ class MLPModel(nn.Module):
 
         # MLP
         self.mlp = MLP(self._get_latent_dim(), mlp_output_dim, hidden_dims, activation)
+        self.aux_value_head = nn.Linear(hidden_dims[-1], 1) if aux_value else None
+        self._aux_value = None
 
         # Initialize distribution-specific MLP weights
         if self.distribution is not None:
@@ -109,7 +162,13 @@ class MLPModel(nn.Module):
         # Get MLP input latent
         latent = self.get_latent(obs, masks, hidden_state)
         # MLP forward pass
-        mlp_output = self.mlp(latent)
+        if self.aux_value_head is None:
+            mlp_output = self.mlp(latent)
+        else:
+            for layer in list(self.mlp.children())[:-1]:
+                latent = layer(latent)
+            self._aux_value = self.aux_value_head(latent)
+            mlp_output = self.mlp[-1](latent)
         # If stochastic output is requested, update the distribution and sample from it, otherwise return MLP output
         if self.distribution is not None:
             if stochastic_output:
@@ -118,6 +177,8 @@ class MLPModel(nn.Module):
                     self.distribution.update(mlp_output)
                 else:
                     condition = obs[condition_group][..., self.distribution.condition_index]
+                    if masks is not None and self.is_recurrent:
+                        condition = unpad_trajectories(condition, masks)
                     self.distribution.update(mlp_output, condition)
                 return self.distribution.sample()
             return self.distribution.deterministic_output(mlp_output)
@@ -129,8 +190,13 @@ class MLPModel(nn.Module):
         """Build the model latent by concatenating and normalizing selected observation groups."""
         # Select and concatenate observations
         latent = torch.cat([obs[obs_group] for obs_group in self.obs_groups], dim=-1)
+        embedding = None
+        if self.coefficient_embedding is not None:
+            latent, embedding = self.coefficient_embedding.split(latent)
         # Normalize observations
         latent = self.obs_normalizer(latent)
+        if self.coefficient_embedding is not None:
+            latent = self.coefficient_embedding.insert(latent, embedding)
         return latent
 
     def reset(self, dones: torch.Tensor | None = None, hidden_state: HiddenState = None) -> None:
@@ -165,6 +231,11 @@ class MLPModel(nn.Module):
         """Return raw parameters of the current output distribution."""
         return self.distribution.params
 
+    @property
+    def output_aux_value(self) -> torch.Tensor | None:
+        """Return the value predicted by the optional shared-trunk head."""
+        return self._aux_value
+
     def get_output_log_prob(self, outputs: torch.Tensor) -> torch.Tensor:
         """Compute log-probabilities of outputs under the current distribution."""
         return self.distribution.log_prob(outputs)
@@ -189,6 +260,8 @@ class MLPModel(nn.Module):
             # Select and concatenate observations
             obs_list = [obs[obs_group] for obs_group in self.obs_groups]
             mlp_obs = torch.cat(obs_list, dim=-1)
+            if self.coefficient_embedding is not None:
+                mlp_obs, _ = self.coefficient_embedding.split(mlp_obs)
             # Update the normalizer parameters
             self.obs_normalizer.update(mlp_obs)  # type: ignore
 
@@ -206,7 +279,7 @@ class MLPModel(nn.Module):
 
     def _get_latent_dim(self) -> int:
         """Return the latent dimensionality consumed by the MLP head."""
-        return self.obs_dim
+        return self.input_dim
 
 
 class _TorchMLPModel(nn.Module):
@@ -215,7 +288,7 @@ class _TorchMLPModel(nn.Module):
     def __init__(self, model: MLPModel) -> None:
         """Create a TorchScript-friendly copy of an MLPModel."""
         super().__init__()
-        self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
+        self.obs_encoder = _ExportObservationEncoder(model)
         self.mlp = copy.deepcopy(model.mlp)
         if model.distribution is not None:
             self.deterministic_output = model.distribution.as_deterministic_output_module()
@@ -224,7 +297,7 @@ class _TorchMLPModel(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run deterministic inference on pre-concatenated observations."""
-        x = self.obs_normalizer(x)
+        x = self.obs_encoder(x)
         out = self.mlp(x)
         return self.deterministic_output(out)
 
@@ -243,7 +316,7 @@ class _OnnxMLPModel(nn.Module):
         """Create an ONNX-export wrapper around an MLPModel."""
         super().__init__()
         self.verbose = verbose
-        self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
+        self.obs_encoder = _ExportObservationEncoder(model)
         self.mlp = copy.deepcopy(model.mlp)
         if model.distribution is not None:
             self.deterministic_output = model.distribution.as_deterministic_output_module()
@@ -253,7 +326,7 @@ class _OnnxMLPModel(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run deterministic inference for ONNX export."""
-        x = self.obs_normalizer(x)
+        x = self.obs_encoder(x)
         out = self.mlp(x)
         return self.deterministic_output(out)
 

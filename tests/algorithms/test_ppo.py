@@ -43,7 +43,7 @@ def _build_ppo(**overrides: object) -> tuple[PPO, TensorDict]:
     """Build a PPO instance with small networks for testing."""
     obs = make_obs(NUM_ENVS, OBS_DIM)
     obs_groups = {"actor": ["policy"], "critic": ["policy"]}
-    actor = _make_actor(obs, obs_groups, NUM_ACTIONS)
+    actor = _make_actor(obs, obs_groups, NUM_ACTIONS, aux_value=overrides.pop("actor_aux_value", False))
     critic = _make_critic(obs, obs_groups)
     storage = RolloutStorage("rl", NUM_ENVS, NUM_STEPS, obs, [NUM_ACTIONS])
 
@@ -223,6 +223,67 @@ class TestTimeoutBootstrapping:
         # Env 1 should have raw reward only
         stored_reward_env1 = ppo.storage.rewards[0, 1, 0].item()
         assert abs(stored_reward_env1 - 1.0) < 1e-5
+
+
+class TestRlGamesParity:
+    """Tests for rl_games-compatible PPO options."""
+
+    def test_reward_scale(self) -> None:
+        """Environment rewards are scaled before storage."""
+        ppo, obs = _build_ppo(reward_scale=0.01)
+        ppo.act(obs)
+        ppo.process_env_step(obs, torch.ones(NUM_ENVS), torch.zeros(NUM_ENVS), {})
+        assert torch.allclose(ppo.storage.rewards[0], torch.full((NUM_ENVS, 1), 0.01))
+
+    def test_bound_loss(self) -> None:
+        """Action means outside the soft bound are penalized."""
+        ppo, _ = _build_ppo(bounds_loss_coef=0.0001)
+        mean = torch.tensor([[1.2, -1.3, 0.0]])
+        assert torch.allclose(ppo._bounds_loss(mean), torch.tensor(0.05))
+
+    def test_value_normalization_update(self) -> None:
+        """Value statistics update and AMP disables itself on CPU."""
+        ppo, obs = _build_ppo(
+            num_learning_epochs=1,
+            num_mini_batches=1,
+            normalize_value=True,
+            bounds_loss_coef=0.0001,
+            mixed_precision=True,
+        )
+        for _ in range(NUM_STEPS):
+            ppo.act(obs)
+            ppo.process_env_step(obs, torch.ones(NUM_ENVS), torch.zeros(NUM_ENVS), {})
+        ppo.compute_returns(obs)
+        normalize = ppo._normalize_values
+        calls = 0
+
+        def count_calls(values: torch.Tensor) -> torch.Tensor:
+            nonlocal calls
+            calls += 1
+            return normalize(values)
+
+        ppo._normalize_values = count_calls
+        losses = ppo.update()
+        assert ppo.value_normalizer.count == 1 + 2 * NUM_ENVS * NUM_STEPS
+        assert calls == 2  # Stored rollout values and returns, not network outputs.
+        assert "bounds" in losses
+        assert not ppo.mixed_precision
+
+    def test_auxiliary_actor_value_head(self) -> None:
+        """The shared actor trunk receives the active rl_games auxiliary value loss."""
+        ppo, obs = _build_ppo(
+            actor_aux_value=True,
+            aux_value_loss_coef=2.0,
+            num_learning_epochs=1,
+            num_mini_batches=1,
+        )
+        for _ in range(NUM_STEPS):
+            ppo.act(obs)
+            ppo.process_env_step(obs, torch.ones(NUM_ENVS), torch.zeros(NUM_ENVS), {})
+        ppo.compute_returns(obs)
+        losses = ppo.update()
+        assert "aux_value" in losses
+        assert ppo.actor.aux_value_head.weight.grad is not None
 
 
 class TestPPOLosses:

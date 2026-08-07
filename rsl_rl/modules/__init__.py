@@ -14,7 +14,7 @@ from .distribution import (
     HeteroscedasticGaussianDistribution,
 )
 from .mlp import MLP
-from .normalization import EmpiricalDiscountedVariationNormalization, EmpiricalNormalization
+from .normalization import EmpiricalDiscountedVariationNormalization, EmpiricalNormalization, RunningMeanStd
 from .rnn import RNN, HiddenState
 
 __all__ = [
@@ -29,4 +29,5 @@ __all__ = [
     "GaussianDistribution",
     "HeteroscedasticGaussianDistribution",
     "HiddenState",
+    "RunningMeanStd",
 ]

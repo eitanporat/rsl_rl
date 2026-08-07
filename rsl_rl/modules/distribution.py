@@ -249,21 +249,27 @@ class CoefficientGaussianDistribution(GaussianDistribution):
         condition_index: int = -1,
         init_std: float = 1.0,
         std_range: tuple[float, float] = (1e-6, 1e6),
+        std_type: str = "scalar",
         learn_std: bool = True,
     ) -> None:
         """Initialize per-coefficient standard deviations."""
-        super().__init__(output_dim, init_std, std_range, "scalar", learn_std)
+        super().__init__(output_dim, init_std, std_range, std_type, learn_std)
         self.condition_group = condition_group
         self.condition_index = condition_index
         self.register_buffer("condition_values", condition_values.detach().clone().flatten())
-        self.std_param = nn.Parameter(
-            init_std * torch.ones(self.condition_values.numel(), output_dim), requires_grad=learn_std
-        )
+        values = init_std * torch.ones(self.condition_values.numel(), output_dim)
+        if std_type == "scalar":
+            self.std_param = nn.Parameter(values, requires_grad=learn_std)
+        else:
+            self.log_std_param = nn.Parameter(values.log(), requires_grad=learn_std)
 
     def update(self, mlp_output: torch.Tensor, condition: torch.Tensor) -> None:
         """Select the standard deviation row matching each coefficient."""
         indices = (condition[..., None] == self.condition_values).long().argmax(dim=-1)
-        std = self.std_param[indices].clamp(self.std_range[0], self.std_range[1])
+        if self.std_type == "scalar":
+            std = self.std_param[indices].clamp(self.std_range[0], self.std_range[1])
+        else:
+            std = self.log_std_param[indices].clamp(*self.log_std_range).exp()
         self._distribution = Normal(mlp_output, std)
 
 

@@ -14,6 +14,7 @@ from tensordict import TensorDict
 from rsl_rl.env import VecEnv
 from rsl_rl.extensions import RandomNetworkDistillation, Symmetry, resolve_rnd_config, resolve_symmetry_config
 from rsl_rl.models import MLPModel
+from rsl_rl.modules import RunningMeanStd
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import compile_model, resolve_callable, resolve_obs_groups, resolve_optimizer
 
@@ -42,6 +43,11 @@ class PPO:
         gamma: float = 0.99,
         lam: float = 0.95,
         value_loss_coef: float = 1.0,
+        aux_value_loss_coef: float = 0.0,
+        reward_scale: float = 1.0,
+        normalize_value: bool = False,
+        bounds_loss_coef: float | None = None,
+        mixed_precision: bool = False,
         entropy_coef: float = 0.01,
         learning_rate: float = 0.001,
         max_grad_norm: float = 1.0,
@@ -104,11 +110,18 @@ class PPO:
         self.num_learning_epochs = num_learning_epochs
         self.num_mini_batches = num_mini_batches
         self.value_loss_coef = value_loss_coef
+        self.aux_value_loss_coef = aux_value_loss_coef
         self.entropy_coef = entropy_coef
         self.gamma = gamma
         self.lam = lam
         self.max_grad_norm = max_grad_norm
         self.use_clipped_value_loss = use_clipped_value_loss
+        self.reward_scale = reward_scale
+        self.normalize_value = normalize_value
+        self.bounds_loss_coef = bounds_loss_coef
+        self.value_normalizer = RunningMeanStd(1).to(device) if normalize_value else None
+        self.mixed_precision = mixed_precision and device.startswith("cuda")
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.mixed_precision)
         self.desired_kl = desired_kl
         self.schedule = schedule
         self.learning_rate = learning_rate
@@ -120,7 +133,7 @@ class PPO:
         self.transition.hidden_states = (self.actor.get_hidden_state(), self.critic.get_hidden_state())
         # Compute the actions and values
         self.transition.actions = self.actor(obs, stochastic_output=True).detach()
-        self.transition.values = self.critic(obs).detach()
+        self.transition.values = self._denormalize_values(self.critic(obs)).detach()
         self.transition.actions_log_prob = self.actor.get_output_log_prob(self.transition.actions).detach()  # type: ignore
         self.transition.distribution_params = tuple(p.detach() for p in self.actor.output_distribution_params)
         # Record observations before env.step()
@@ -139,13 +152,14 @@ class PPO:
 
         # Record the rewards and dones
         # Note: We clone here because later on we bootstrap the rewards based on timeouts
+        rewards = rewards * self.reward_scale
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
 
         # Compute the intrinsic rewards and add to extrinsic rewards
         if self.rnd:
             # Compute the intrinsic rewards
-            self.intrinsic_rewards = self.rnd.get_intrinsic_reward(obs)
+            self.intrinsic_rewards = self.rnd.get_intrinsic_reward(obs) * self.reward_scale
             # Add intrinsic rewards to extrinsic rewards
             self.transition.rewards += self.intrinsic_rewards
 
@@ -167,7 +181,7 @@ class PPO:
         st = self.storage
         # Compute values for the last step
         critic_hidden_state = self.critic.get_hidden_state()
-        last_values = self.critic(obs).detach()
+        last_values = self._denormalize_values(self.critic(obs)).detach()
         # Restore the critic's hidden state so the next rollout is not affected by the forward pass
         self.critic.reset(hidden_state=critic_hidden_state)
         # Compute returns and advantages
@@ -191,9 +205,19 @@ class PPO:
 
     def update(self) -> dict[str, float]:
         """Run optimization epochs over stored batches and return mean losses."""
+        if self.value_normalizer is not None:
+            self.value_normalizer.train()
+            self.value_normalizer.update(self.storage.values.reshape(-1, 1))
+            self.storage.values = self._normalize_values(self.storage.values)
+            self.value_normalizer.update(self.storage.returns.reshape(-1, 1))
+            self.storage.returns = self._normalize_values(self.storage.returns)
+            self.value_normalizer.eval()
+
         mean_value_loss = 0
+        mean_aux_value_loss = 0 if self.aux_value_loss_coef else None
         mean_surrogate_loss = 0
         mean_entropy = 0
+        mean_bounds_loss = 0 if self.bounds_loss_coef is not None else None
         # RND loss
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
@@ -220,14 +244,15 @@ class PPO:
 
             # Recompute actions log prob and entropy for current batch of transitions
             # Note: We need to do this because we updated the policy with new parameters
-            self.actor(
-                batch.observations,
-                masks=batch.masks,
-                hidden_state=batch.hidden_states[0],
-                stochastic_output=True,
-            )
-            actions_log_prob = self.actor.get_output_log_prob(batch.actions)  # type: ignore
-            values = self.critic(batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[1])
+            with torch.autocast("cuda", enabled=self.mixed_precision):
+                self.actor(
+                    batch.observations,
+                    masks=batch.masks,
+                    hidden_state=batch.hidden_states[0],
+                    stochastic_output=True,
+                )
+                actions_log_prob = self.actor.get_output_log_prob(batch.actions)  # type: ignore
+                values = self.critic(batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[1])
             # Note: We only keep the following tensors for the original samples in case of symmetry augmentation
             distribution_params = tuple(p[:original_batch_size] for p in self.actor.output_distribution_params)
             entropy = self.actor.output_entropy[:original_batch_size]
@@ -277,7 +302,26 @@ class PPO:
             else:
                 value_loss = (batch.returns - values).pow(2).mean()
 
-            loss = surrogate_loss + self.value_loss_coef * value_loss - self._entropy_loss(entropy, batch)
+            aux_value_loss = None
+            if self.aux_value_loss_coef:
+                aux_values = self.actor.output_aux_value
+                if self.use_clipped_value_loss:
+                    aux_clipped = batch.values + (aux_values - batch.values).clamp(-self.clip_param, self.clip_param)
+                    aux_value_loss = torch.max(
+                        (aux_values - batch.returns).pow(2),
+                        (aux_clipped - batch.returns).pow(2),
+                    ).mean()
+                else:
+                    aux_value_loss = (batch.returns - aux_values).pow(2).mean()
+
+            bounds_loss = self._bounds_loss(self.actor.output_mean)
+            loss = (
+                surrogate_loss
+                + self.value_loss_coef * value_loss
+                + self.aux_value_loss_coef * (aux_value_loss if aux_value_loss is not None else 0.0)
+                + (self.bounds_loss_coef or 0.0) * bounds_loss
+                - self._entropy_loss(entropy, batch)
+            )
 
             # RND loss
             rnd_loss = self.rnd.compute_loss(batch.observations[:original_batch_size]) if self.rnd else None  # type: ignore
@@ -290,7 +334,7 @@ class PPO:
 
             # Compute the gradients for PPO
             self.optimizer.zero_grad()
-            loss.backward()
+            self.scaler.scale(loss).backward()
             # Compute the gradients for RND
             if self.rnd:
                 self.rnd.optimizer.zero_grad()
@@ -301,17 +345,23 @@ class PPO:
                 self.reduce_parameters()
 
             # Apply the gradients for PPO
+            self.scaler.unscale_(self.optimizer)
             nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
             nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
-            self.optimizer.step()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
             # Apply the gradients for RND
             if self.rnd:
                 self.rnd.optimizer.step()
 
             # Store the losses
             mean_value_loss += value_loss.item()
+            if mean_aux_value_loss is not None:
+                mean_aux_value_loss += aux_value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
             mean_entropy += entropy.mean().item()
+            if mean_bounds_loss is not None:
+                mean_bounds_loss += bounds_loss.item()
             # RND loss
             if mean_rnd_loss is not None:
                 mean_rnd_loss += rnd_loss.item()
@@ -322,8 +372,12 @@ class PPO:
         # Divide the losses by the number of updates
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
+        if mean_aux_value_loss is not None:
+            mean_aux_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
+        if mean_bounds_loss is not None:
+            mean_bounds_loss /= num_updates
         if mean_rnd_loss is not None:
             mean_rnd_loss /= num_updates
         if mean_symmetry_loss is not None:
@@ -335,6 +389,10 @@ class PPO:
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
         }
+        if mean_bounds_loss is not None:
+            loss_dict["bounds"] = mean_bounds_loss
+        if mean_aux_value_loss is not None:
+            loss_dict["aux_value"] = mean_aux_value_loss
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
@@ -347,6 +405,23 @@ class PPO:
 
     def _entropy_loss(self, entropy: torch.Tensor, batch: RolloutStorage.Batch) -> torch.Tensor:
         return self.entropy_coef * entropy.mean()
+
+    def _normalize_values(self, values: torch.Tensor) -> torch.Tensor:
+        if self.value_normalizer is None:
+            return values
+        return self.value_normalizer(values)
+
+    def _denormalize_values(self, values: torch.Tensor) -> torch.Tensor:
+        if self.value_normalizer is None:
+            return values
+        return self.value_normalizer.inverse(values)
+
+    def _bounds_loss(self, mean: torch.Tensor) -> torch.Tensor:
+        if self.bounds_loss_coef is None:
+            return mean.new_zeros(())
+        high = torch.clamp_min(mean - 1.1, 0.0).square()
+        low = torch.clamp_max(mean + 1.1, 0.0).square()
+        return (high + low).sum(dim=-1).mean()
 
     def train_mode(self) -> None:
         """Set train mode for learnable models."""
@@ -369,6 +444,10 @@ class PPO:
             "critic_state_dict": self._raw_critic.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
         }
+        if self.value_normalizer is not None:
+            saved_dict["value_normalizer_state_dict"] = self.value_normalizer.state_dict()
+        if self.mixed_precision:
+            saved_dict["scaler_state_dict"] = self.scaler.state_dict()
         if self.rnd:
             saved_dict["rnd_state_dict"] = self.rnd.state_dict()
             saved_dict["rnd_optimizer_state_dict"] = self.rnd.optimizer.state_dict()
@@ -397,6 +476,10 @@ class PPO:
         if load_cfg.get("rnd") and self.rnd:
             self.rnd.load_state_dict(loaded_dict["rnd_state_dict"], strict=strict)
             self.rnd.optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
+        if self.value_normalizer is not None and "value_normalizer_state_dict" in loaded_dict:
+            self.value_normalizer.load_state_dict(loaded_dict["value_normalizer_state_dict"])
+        if self.mixed_precision and "scaler_state_dict" in loaded_dict:
+            self.scaler.load_state_dict(loaded_dict["scaler_state_dict"])
         return load_cfg.get("iteration", False)
 
     def get_policy(self) -> MLPModel:

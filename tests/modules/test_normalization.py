@@ -7,7 +7,25 @@
 
 import torch
 
-from rsl_rl.modules.normalization import EmpiricalDiscountedVariationNormalization, EmpiricalNormalization
+from rsl_rl.modules.normalization import (
+    EmpiricalDiscountedVariationNormalization,
+    EmpiricalNormalization,
+    RunningMeanStd,
+)
+
+
+def test_rl_games_running_mean_std() -> None:
+    """Match rl_games' initial count, moment update, clipping, and inverse."""
+    norm = RunningMeanStd(1)
+    values = torch.arange(1.0, 5.0).unsqueeze(1)
+    norm.update(values)
+
+    assert torch.allclose(norm.mean, torch.tensor([2.0], dtype=torch.float64))
+    assert torch.allclose(norm.var, torch.tensor([38 / 15], dtype=torch.float64))
+    assert norm.count == 5
+    normalized = norm(values)
+    assert torch.allclose(norm.inverse(normalized), values)
+    assert norm(torch.tensor([[100.0]])).item() == 5
 
 
 class TestEmpiricalNormalization:

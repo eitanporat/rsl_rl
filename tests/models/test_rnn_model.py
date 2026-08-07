@@ -186,6 +186,7 @@ class TestRNNModelJITExport:
             rnn_type=rnn_type,
             rnn_hidden_dim=16,
             rnn_num_layers=1,
+            rnn_layer_norm=True,
             distribution_cfg={"class_name": "GaussianDistribution", "init_std": 1.0, "std_type": "scalar"},
         )
         model.eval()
@@ -213,6 +214,7 @@ class TestRNNModelJITExport:
             rnn_type=rnn_type,
             rnn_hidden_dim=16,
             rnn_num_layers=1,
+            rnn_layer_norm=True,
             distribution_cfg={"class_name": "GaussianDistribution", "init_std": 1.0, "std_type": "scalar"},
         )
         model.eval()

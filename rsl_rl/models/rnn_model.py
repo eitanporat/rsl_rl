@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 from tensordict import TensorDict
 
-from rsl_rl.models.mlp_model import MLPModel
+from rsl_rl.models.mlp_model import MLPModel, _ExportObservationEncoder
 from rsl_rl.modules import RNN, HiddenState
 
 
@@ -37,9 +37,12 @@ class RNNModel(MLPModel):
         activation: str = "elu",
         obs_normalization: bool = False,
         distribution_cfg: dict | None = None,
+        aux_value: bool = False,
+        coefficient_embedding_cfg: dict | None = None,
         rnn_type: str = "lstm",
         rnn_hidden_dim: int = 256,
         rnn_num_layers: int = 1,
+        rnn_layer_norm: bool = False,
     ) -> None:
         """Initialize the RNN-based model.
 
@@ -52,9 +55,12 @@ class RNNModel(MLPModel):
             activation: Activation function of the MLP.
             obs_normalization: Whether to normalize the observations before feeding them to the MLP.
             distribution_cfg: Configuration dictionary for the output distribution.
+            aux_value: Whether to add a value head sharing the model trunk.
+            coefficient_embedding_cfg: Learned scalar-coefficient embedding configuration.
             rnn_type: Type of RNN to use ("lstm" or "gru").
             rnn_hidden_dim: Dimension of the RNN hidden state.
             rnn_num_layers: Number of RNN layers.
+            rnn_layer_norm: Whether to normalize recurrent outputs before the MLP.
         """
         self.latent_dim = rnn_hidden_dim
 
@@ -68,10 +74,13 @@ class RNNModel(MLPModel):
             activation,
             obs_normalization,
             distribution_cfg,
+            aux_value,
+            coefficient_embedding_cfg,
         )
 
         # RNN
-        self.rnn = RNN(self.obs_dim, rnn_hidden_dim, rnn_num_layers, rnn_type)
+        self.rnn = RNN(self.input_dim, rnn_hidden_dim, rnn_num_layers, rnn_type)
+        self.rnn_layer_norm = nn.LayerNorm(rnn_hidden_dim) if rnn_layer_norm else nn.Identity()
 
     def get_latent(
         self, obs: TensorDict, masks: torch.Tensor | None = None, hidden_state: HiddenState = None
@@ -81,7 +90,7 @@ class RNNModel(MLPModel):
         latent = super().get_latent(obs)
         # Pass through the RNN
         latent = self.rnn(latent, masks, hidden_state).squeeze(0)
-        return latent
+        return self.rnn_layer_norm(latent)
 
     def reset(self, dones: torch.Tensor | None = None, hidden_state: HiddenState = None) -> None:
         """Reset the recurrent hidden state of the RNN."""
@@ -119,8 +128,9 @@ class _TorchGRUModel(nn.Module):
     def __init__(self, model: RNNModel) -> None:
         """Create a TorchScript-friendly copy of a GRU-based RNNModel."""
         super().__init__()
-        self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
+        self.obs_encoder = _ExportObservationEncoder(model)
         self.rnn = copy.deepcopy(model.rnn.rnn)  # Access underlying torch module to avoid wrapper logic during export
+        self.rnn_layer_norm = copy.deepcopy(model.rnn_layer_norm)
         self.mlp = copy.deepcopy(model.mlp)
         if model.distribution is not None:
             self.deterministic_output = model.distribution.as_deterministic_output_module()
@@ -131,10 +141,11 @@ class _TorchGRUModel(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run one GRU inference step and update hidden states."""
-        x = self.obs_normalizer(x)
+        x = self.obs_encoder(x)
         x, h = self.rnn(x.unsqueeze(0), self.hidden_state)
         self.hidden_state[:] = h  # type: ignore
         x = x.squeeze(0)
+        x = self.rnn_layer_norm(x)
         out = self.mlp(x)
         return self.deterministic_output(out)
 
@@ -150,8 +161,9 @@ class _TorchLSTMModel(nn.Module):
     def __init__(self, model: RNNModel) -> None:
         """Create a TorchScript-friendly copy of an LSTM-based RNNModel."""
         super().__init__()
-        self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
+        self.obs_encoder = _ExportObservationEncoder(model)
         self.rnn = copy.deepcopy(model.rnn.rnn)  # Access underlying torch module to avoid wrapper logic during export
+        self.rnn_layer_norm = copy.deepcopy(model.rnn_layer_norm)
         self.mlp = copy.deepcopy(model.mlp)
         if model.distribution is not None:
             self.deterministic_output = model.distribution.as_deterministic_output_module()
@@ -162,11 +174,12 @@ class _TorchLSTMModel(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run one LSTM inference step and update hidden and cell states."""
-        x = self.obs_normalizer(x)
+        x = self.obs_encoder(x)
         x, (h, c) = self.rnn(x.unsqueeze(0), (self.hidden_state, self.cell_state))
         self.hidden_state[:] = h  # type: ignore
         self.cell_state[:] = c  # type: ignore
         x = x.squeeze(0)
+        x = self.rnn_layer_norm(x)
         out = self.mlp(x)
         return self.deterministic_output(out)
 
@@ -186,8 +199,9 @@ class _OnnxRNNModel(nn.Module):
         """Create an ONNX-export wrapper around an RNNModel."""
         super().__init__()
         self.verbose = verbose
-        self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
+        self.obs_encoder = _ExportObservationEncoder(model)
         self.rnn = copy.deepcopy(model.rnn.rnn)  # Access underlying torch module to avoid wrapper logic during export
+        self.rnn_layer_norm = copy.deepcopy(model.rnn_layer_norm)
         self.mlp = copy.deepcopy(model.mlp)
         if model.distribution is not None:
             self.deterministic_output = model.distribution.as_deterministic_output_module()
@@ -210,17 +224,19 @@ class _OnnxRNNModel(nn.Module):
         self, obs: torch.Tensor, h_in: torch.Tensor, c_in: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Run deterministic inference for ONNX export."""
-        x = self.obs_normalizer(obs)
+        x = self.obs_encoder(obs)
 
         if self.rnn_type == "lstm":
             x, (h, c) = self.rnn(x.unsqueeze(0), (h_in, c_in))
             x = x.squeeze(0)
+            x = self.rnn_layer_norm(x)
             out = self.mlp(x)
             out = self.deterministic_output(out)
             return out, h, c
         else:
             x, h = self.rnn(x.unsqueeze(0), h_in)
             x = x.squeeze(0)
+            x = self.rnn_layer_norm(x)
             out = self.mlp(x)
             out = self.deterministic_output(out)
             return out, h, None

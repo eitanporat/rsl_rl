@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 from tensordict import TensorDict
-from typing import Any
 
 from rsl_rl.algorithms.ppo import PPO
 from rsl_rl.models import MLPModel
 from rsl_rl.modules import HiddenState
 from rsl_rl.storage import RolloutStorage
+from rsl_rl.utils import unpad_trajectories
 
 
 def _create_coef_embd(num_blocks: int, embd_size: int, device: str) -> torch.Tensor:
@@ -27,7 +29,7 @@ def _cat_obs(observations: list[TensorDict]) -> TensorDict:
     return TensorDict(
         {
             key: torch.cat([observation[key] for observation in observations], dim=1)
-            for key in observations[0].keys()  # noqa: SIM118 - TensorDict iteration yields values
+            for key in observations[0].keys()  # ruff: ignore[SIM118] - TensorDict iteration yields values
         },
         batch_size=[observations[0].shape[0], sum(observation.shape[1] for observation in observations)],
     )
@@ -68,7 +70,9 @@ class SAPG(PPO):
         super().__init__(actor, critic, storage, **kwargs)
         cfg = sapg_cfg or {}
         self.block_size = int(cfg.get("expl_coef_block_size", 4096))
-        self.embd_size = int(cfg.get("expl_reward_coef_embd_size", 32))
+        self.embd_size = (
+            1 if "learn_param" in cfg.get("expl_type", "") else int(cfg.get("expl_reward_coef_embd_size", 32))
+        )
         self.scale = float(cfg.get("expl_reward_coef_scale", 0.002))
         self.off_policy_ratio = float(cfg.get("off_policy_ratio", 1.0))
         self.use_others_experience = cfg.get("use_others_experience", "lf")
@@ -76,11 +80,6 @@ class SAPG(PPO):
         if storage.num_envs % self.block_size:
             raise ValueError(f"num_envs {storage.num_envs} must be divisible by block size {self.block_size}")
         self.coef_embd = _create_coef_embd(self.num_blocks, self.embd_size, self.device)
-        self.reward_coef = (
-            torch.linspace(0.5, 0.0, self.num_blocks, device=self.device)
-            .repeat_interleave(self.block_size)
-            .mul(self.scale)
-        )
         self._original_storage: dict[str, object] | None = None
 
     def compute_returns(self, obs: TensorDict) -> None:
@@ -100,7 +99,10 @@ class SAPG(PPO):
             self._restore_storage()
 
     def _entropy_loss(self, entropy: torch.Tensor, batch: RolloutStorage.Batch) -> torch.Tensor:
-        coef = batch.observations["actor"][..., -self.embd_size] / 50.0 * (0.5 * self.scale)
+        actor_obs = batch.observations["actor"]
+        if batch.masks is not None:
+            actor_obs = unpad_trajectories(actor_obs, batch.masks)
+        coef = actor_obs[..., -self.embd_size] / 50.0 * (0.5 * self.scale)
         while entropy.ndim > coef.ndim:
             entropy = entropy.squeeze(-1)
         return (coef * entropy).mean()
@@ -110,8 +112,8 @@ class SAPG(PPO):
         self, observations: TensorDict, last_obs: TensorDict, source: torch.Tensor, last_hidden: HiddenState
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if not self.critic.is_recurrent:
-            values = self.critic(observations).detach()
-            last = self.critic(last_obs).detach()
+            values = self._denormalize_values(self.critic(observations)).detach()
+            last = self._denormalize_values(self.critic(last_obs)).detach()
             return values, last
 
         saved_hidden = self.storage.saved_hidden_state_c
@@ -123,9 +125,9 @@ class SAPG(PPO):
                 parts = tuple(value[step][:, source] for value in saved_hidden)
                 hidden = parts[0] if len(parts) == 1 else parts
             self.critic.reset(hidden_state=hidden)
-            values.append(self.critic(observations[step]).detach())
+            values.append(self._denormalize_values(self.critic(observations[step])).detach())
         self.critic.reset(hidden_state=_slice_hidden(last_hidden, source))
-        last = self.critic(last_obs).detach()
+        last = self._denormalize_values(self.critic(last_obs)).detach()
         self.critic.reset(hidden_state=current_hidden)
         return torch.stack(values), last
 
@@ -135,22 +137,10 @@ class SAPG(PPO):
         dones: torch.Tensor,
         values: torch.Tensor,
         last_values: torch.Tensor,
-        source: torch.Tensor,
-        repeat_idx: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        intrinsic = getattr(self.storage, "intrinsic_rewards", None)
-        if intrinsic is not None:
-            coef = torch.roll(self.reward_coef, self.block_size * repeat_idx)[source]
-            rewards = rewards + coef[None, :, None] * intrinsic[:, source]
         next_values = torch.cat((values[1:], last_values.unsqueeze(0)))
-        advantage = torch.zeros_like(values[0])
-        advantages = torch.zeros_like(values)
-        for step in reversed(range(values.shape[0])):
-            not_done = 1.0 - dones[step].float()
-            delta = rewards[step] + self.gamma * not_done * next_values[step] - values[step]
-            advantage = delta + self.gamma * self.lam * not_done * advantage
-            advantages[step] = advantage
-        return values + advantages, advantages
+        returns = rewards + self.gamma * (1.0 - dones.float()) * next_values
+        return returns, returns - values
 
     def _augment_storage(self, last_obs: TensorDict, last_hidden: HiddenState) -> None:
         storage = self.storage
@@ -172,9 +162,6 @@ class SAPG(PPO):
             )
             if hasattr(storage, name)
         }
-        if hasattr(storage, "intrinsic_rewards"):
-            self._original_storage["intrinsic_rewards"] = storage.intrinsic_rewards
-
         repeat_count = min(self.num_blocks, int(self.off_policy_ratio) + 1)
         repeat_idxs = [0]
         if repeat_count > 1 and self.gpu_global_rank == 0:
@@ -197,10 +184,7 @@ class SAPG(PPO):
         values = [storage.values]
         returns = [storage.returns]
         advantages = [storage.advantages]
-        tensor_parts = {
-            name: [getattr(storage, name)]
-            for name in ("actions", "rewards", "dones", "actions_log_prob")
-        }
+        tensor_parts = {name: [getattr(storage, name)] for name in ("actions", "rewards", "dones", "actions_log_prob")}
         distribution_parts = [[part] for part in storage.distribution_params]
         hidden_a = [storage.saved_hidden_state_a]
         hidden_c = [storage.saved_hidden_state_c]
@@ -209,9 +193,7 @@ class SAPG(PPO):
             embedding = self.coef_embd.repeat_interleave(self.block_size, dim=0)
             tail = torch.roll(embedding, self.block_size * repeat_idx, dims=0)[source]
             follower_obs = _replace_tail(_slice_obs(storage.observations, source, 1), tail, self.embd_size)
-            follower_last_obs = _replace_tail(
-                _slice_obs(last_obs, source, 0), tail, self.embd_size
-            )
+            follower_last_obs = _replace_tail(_slice_obs(last_obs, source, 0), tail, self.embd_size)
             follower_values, follower_last_values = self._values_for(
                 follower_obs, follower_last_obs, source, last_hidden
             )
@@ -220,8 +202,6 @@ class SAPG(PPO):
                 storage.dones[:, source],
                 follower_values,
                 follower_last_values,
-                source,
-                repeat_idx,
             )
             observations.append(follower_obs)
             values.append(follower_values)
@@ -242,7 +222,6 @@ class SAPG(PPO):
         storage.values = torch.cat(values, dim=1)
         storage.returns = torch.cat(returns, dim=1)
         storage.advantages = torch.cat(advantages, dim=1)
-        storage.actions_log_prob = torch.cat(tensor_parts["actions_log_prob"], dim=1)
         storage.distribution_params = tuple(torch.cat(parts, dim=1) for parts in distribution_parts)
         if storage.saved_hidden_state_a is not None:
             storage.saved_hidden_state_a = [torch.cat([part for part in parts], dim=2) for parts in zip(*hidden_a)]
