@@ -229,6 +229,9 @@ class PPO:
         else:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
 
+        # KL of each mini-batch in the current mini-epoch, for the adaptive schedule.
+        epoch_kls: list[torch.Tensor] = []
+
         # Iterate over mini-batches
         for batch in generator:
             original_batch_size = batch.observations.batch_size[0]
@@ -268,11 +271,20 @@ class PPO:
                         torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
                         kl_mean /= self.gpu_world_size
 
+                    # rl_games' "standard" schedule steps the learning rate once per
+                    # mini-epoch off the mean KL of that epoch's mini-batches, not
+                    # once per mini-batch, which would let it swing 1.5^n per epoch.
+                    epoch_kls.append(kl_mean)
+
+                if len(epoch_kls) == self.num_mini_batches:
+                    epoch_kl = torch.stack(epoch_kls).mean()
+                    epoch_kls.clear()
+
                     # Update the learning rate only on the main process
                     if self.gpu_global_rank == 0:
-                        if kl_mean > self.desired_kl * 2.0:
-                            self.learning_rate = max(1e-5, self.learning_rate / 1.5)
-                        elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
+                        if epoch_kl > self.desired_kl * 2.0:
+                            self.learning_rate = max(1e-6, self.learning_rate / 1.5)
+                        elif epoch_kl < self.desired_kl / 2.0 and epoch_kl > 0.0:
                             self.learning_rate = min(1e-2, self.learning_rate * 1.5)
 
                     # Update the learning rate for all GPUs
