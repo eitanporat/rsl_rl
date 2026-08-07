@@ -371,7 +371,9 @@ def split_and_pad_trajectories(
         # Remove the added trajectory
         padded_trajectories = padded_trajectories[:, :-1]
     # Create masks for the valid parts of the trajectories
-    trajectory_masks = trajectory_lengths > torch.arange(0, tensor.shape[0], device=tensor.device).unsqueeze(1)
+    trajectory_masks = trajectory_lengths.to(tensor.device) > torch.arange(
+        0, tensor.shape[0], device=tensor.device
+    ).unsqueeze(1)
     return padded_trajectories, trajectory_masks
 
 

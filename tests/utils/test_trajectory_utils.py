@@ -86,6 +86,15 @@ class TestSplitAndPad:
         # Traj 3 (Env 1, Part 1)
         assert torch.allclose(padded_traj[:, 2], data[:, 1])
 
+    def test_split_and_pad_cuda(self) -> None:
+        if not torch.cuda.is_available():
+            return
+        data = torch.randn(5, 2, 3, device="cuda")
+        dones = torch.zeros(5, 2, dtype=torch.bool, device="cuda")
+        dones[1, 0] = True
+        _, masks = split_and_pad_trajectories(data, dones)
+        assert masks.device == data.device
+
     def test_split_and_pad_tensordict(self) -> None:
         """Test that TensorDicts are handled recursively and shapes match.
 
