@@ -349,18 +349,15 @@ def split_and_pad_trajectories(
     # Extract the individual trajectories
     if isinstance(tensor, TensorDict):
         padded_trajectories = {}
-        for k, v in tensor.items():
-            # Split the tensor into trajectories
-            trajectories = torch.split(v.transpose(1, 0).flatten(0, 1), trajectory_lengths_list)
-            # Add at least one full length trajectory
-            trajectories = (*trajectories, torch.zeros(v.shape[0], *v.shape[2:], device=v.device))
-            # Pad the trajectories to the length of the longest trajectory
-            padded_trajectories[k] = torch.nn.utils.rnn.pad_sequence(trajectories)  # type: ignore
-            # Remove the added trajectory
-            padded_trajectories[k] = padded_trajectories[k][:, :-1]
-        padded_trajectories = TensorDict(
-            padded_trajectories, batch_size=[tensor.batch_size[0], len(trajectory_lengths_list)], device=tensor.device
-        )
+        masks = None
+        for key, value in tensor.items():
+            padded_trajectories[key], masks = split_and_pad_trajectories(value, dones)
+        assert masks is not None
+        return TensorDict(
+            padded_trajectories,
+            batch_size=next(iter(padded_trajectories.values())).shape[:2],
+            device=tensor.device,
+        ), masks
     else:
         # Split the tensor into trajectories
         trajectories = torch.split(tensor.transpose(1, 0).flatten(0, 1), trajectory_lengths_list)
@@ -380,12 +377,16 @@ def split_and_pad_trajectories(
 def unpad_trajectories(trajectories: torch.Tensor | TensorDict, masks: torch.Tensor) -> torch.Tensor | TensorDict:
     """Do the inverse operation of `split_and_pad_trajectories()`."""
     # Select valid steps and flatten to sequence of valid steps
+    if isinstance(trajectories, TensorDict):
+        values = {
+            key: unpad_trajectories(value, masks) for key, value in trajectories.items()
+        }
+        return TensorDict(
+            values,
+            batch_size=next(iter(values.values())).shape[:2],
+            device=trajectories.device,
+        )
     valid_steps = trajectories.transpose(1, 0)[masks.transpose(1, 0)]
     # Reshape back to original dimensions
-    if isinstance(trajectories, TensorDict):
-        # TensorDict.view() only modifies the batch size.
-        # We reshape [valid_steps] -> [number of envs, time] and then transpose back to [time, number of envs]
-        return valid_steps.view(-1, trajectories.shape[0]).transpose(1, 0)
-    else:
-        # For standard Tensors, we must explicitly handle feature dimensions in view()
-        return valid_steps.view(-1, trajectories.shape[0], *trajectories.shape[2:]).transpose(1, 0)
+    # For standard Tensors, we must explicitly handle feature dimensions in view()
+    return valid_steps.view(-1, trajectories.shape[0], *trajectories.shape[2:]).transpose(1, 0)

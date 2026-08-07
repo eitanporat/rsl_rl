@@ -126,6 +126,18 @@ class TestSplitAndPad:
         # Check integrity of one specific value
         assert torch.allclose(padded_td["obs_0"][:3, 1], obs_0[2:, 0])
 
+    def test_unpad_nested_tensordict_round_trip(self) -> None:
+        data = TensorDict(
+            {"actor": TensorDict({"obs": torch.randn(5, 2, 3)}, batch_size=(5, 2))},
+            batch_size=(5, 2),
+        )
+        dones = torch.zeros(5, 2, dtype=torch.bool)
+        dones[1, 0] = True
+        padded, masks = split_and_pad_trajectories(data, dones)
+        output = unpad_trajectories(padded, masks)
+        assert output.shape == data.shape
+        assert torch.allclose(output["actor", "obs"], data["actor", "obs"])
+
 
 class TestUnpad:
     """Tests for ``unpad_trajectories``."""
