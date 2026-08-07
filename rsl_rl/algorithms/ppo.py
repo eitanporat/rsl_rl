@@ -57,6 +57,8 @@ class PPO:
         symmetry_cfg: dict | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
+        # Optional SAPG parameters (consumed by the SAPG subclass)
+        sapg_cfg: dict | None = None,
     ) -> None:
         """Initialize the algorithm with models, storage, and optimization settings."""
         # Device-related parameters
@@ -275,7 +277,7 @@ class PPO:
             else:
                 value_loss = (batch.returns - values).pow(2).mean()
 
-            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
+            loss = surrogate_loss + self.value_loss_coef * value_loss - self._entropy_loss(entropy, batch)
 
             # RND loss
             rnd_loss = self.rnd.compute_loss(batch.observations[:original_batch_size]) if self.rnd else None  # type: ignore
@@ -342,6 +344,9 @@ class PPO:
         self.storage.clear()
 
         return loss_dict
+
+    def _entropy_loss(self, entropy: torch.Tensor, batch: RolloutStorage.Batch) -> torch.Tensor:
+        return self.entropy_coef * entropy.mean()
 
     def train_mode(self) -> None:
         """Set train mode for learnable models."""
