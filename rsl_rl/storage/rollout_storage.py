@@ -137,6 +137,7 @@ class RolloutStorage:
         self.num_transitions_per_env = num_transitions_per_env
         self.num_envs = num_envs
         self.actions_shape = actions_shape
+        self.shuffle_trajectories = False
 
         # Core
         self.observations = TensorDict(
@@ -273,7 +274,11 @@ class RolloutStorage:
             # mini-batches are fixed contiguous env slices, which keeps SAPG's
             # exploration blocks and its off-policy followers in separate
             # mini-batches instead of mixing them into every gradient step.
-            perm = torch.randperm(self.num_envs, device=self.dones.device)
+            perm = (
+                torch.randperm(self.num_envs, device=self.dones.device)
+                if self.shuffle_trajectories
+                else torch.arange(self.num_envs, device=self.dones.device)
+            )
             padded_obs_trajectories, trajectory_masks = split_and_pad_trajectories(
                 self.observations[:, perm], self.dones[:, perm]
             )
@@ -294,16 +299,18 @@ class RolloutStorage:
                 else None
             )
 
+            dones = self.dones[:, perm].squeeze(-1)
+            was_done = torch.zeros_like(dones, dtype=torch.bool)
+            was_done[1:] = dones[:-1]
+            was_done[0] = True
+
             first_traj = 0
             for i in range(num_mini_batches):
                 # Select the indices for the mini-batch
                 start = i * mini_batch_size
                 stop = (i + 1) * mini_batch_size
 
-                dones = self.dones[:, perm].squeeze(-1)
-                last_was_done = torch.zeros_like(dones, dtype=torch.bool)
-                last_was_done[1:] = dones[:-1]
-                last_was_done[0] = True
+                last_was_done = was_done
                 trajectories_batch_size = torch.sum(last_was_done[:, start:stop])
                 last_traj = first_traj + trajectories_batch_size
 

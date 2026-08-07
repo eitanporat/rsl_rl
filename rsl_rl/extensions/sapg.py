@@ -80,6 +80,7 @@ class SAPG(PPO):
         if storage.num_envs % self.block_size:
             raise ValueError(f"num_envs {storage.num_envs} must be divisible by block size {self.block_size}")
         self.coef_embd = _create_coef_embd(self.num_blocks, self.embd_size, self.device)
+        storage.shuffle_trajectories = True
         self._original_storage: dict[str, object] | None = None
 
     def compute_returns(self, obs: TensorDict) -> None:
