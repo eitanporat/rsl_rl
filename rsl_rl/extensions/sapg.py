@@ -27,7 +27,7 @@ def _cat_obs(observations: list[TensorDict]) -> TensorDict:
     return TensorDict(
         {
             key: torch.cat([observation[key] for observation in observations], dim=1)
-            for key in observations[0]
+            for key in observations[0].keys()  # noqa: SIM118 - TensorDict iteration yields values
         },
         batch_size=[observations[0].shape[0], sum(observation.shape[1] for observation in observations)],
     )

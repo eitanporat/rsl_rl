@@ -238,6 +238,35 @@ class GaussianDistribution(Distribution):
         return torch.distributions.kl_divergence(Normal(old_mean, old_std), Normal(new_mean, new_std)).sum(dim=-1)
 
 
+class CoefficientGaussianDistribution(GaussianDistribution):
+    """Gaussian distribution with one learnable standard deviation per coefficient."""
+
+    def __init__(
+        self,
+        output_dim: int,
+        condition_values: torch.Tensor,
+        condition_group: str = "actor",
+        condition_index: int = -1,
+        init_std: float = 1.0,
+        std_range: tuple[float, float] = (1e-6, 1e6),
+        learn_std: bool = True,
+    ) -> None:
+        """Initialize per-coefficient standard deviations."""
+        super().__init__(output_dim, init_std, std_range, "scalar", learn_std)
+        self.condition_group = condition_group
+        self.condition_index = condition_index
+        self.register_buffer("condition_values", condition_values.detach().clone().flatten())
+        self.std_param = nn.Parameter(
+            init_std * torch.ones(self.condition_values.numel(), output_dim), requires_grad=learn_std
+        )
+
+    def update(self, mlp_output: torch.Tensor, condition: torch.Tensor) -> None:
+        """Select the standard deviation row matching each coefficient."""
+        indices = (condition[..., None] == self.condition_values).long().argmax(dim=-1)
+        std = self.std_param[indices].clamp(self.std_range[0], self.std_range[1])
+        self._distribution = Normal(mlp_output, std)
+
+
 class HeteroscedasticGaussianDistribution(GaussianDistribution):
     """Gaussian distribution module with state-dependent standard deviation.
 

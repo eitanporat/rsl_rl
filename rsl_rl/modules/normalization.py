@@ -15,7 +15,13 @@ from torch import nn
 class EmpiricalNormalization(nn.Module):
     """Normalize mean and variance of values based on empirical values."""
 
-    def __init__(self, shape: int | tuple[int, ...] | list[int], eps: float = 1e-2, until: int | None = None) -> None:
+    def __init__(
+        self,
+        shape: int | tuple[int, ...] | list[int],
+        eps: float = 1e-2,
+        until: int | None = None,
+        unnormalized_tail_dim: int = 0,
+    ) -> None:
         """Initialize EmpiricalNormalization module.
 
         .. note:: The normalization parameters are computed over the whole batch, not for each environment separately.
@@ -24,10 +30,12 @@ class EmpiricalNormalization(nn.Module):
             shape: Shape of input values except batch axis.
             eps: Small value for stability.
             until: If this arg is specified, the module learns input values until the sum of batch sizes exceeds it.
+            unnormalized_tail_dim: Number of trailing features to pass through unchanged.
         """
         super().__init__()
         self.eps = eps
         self.until = until
+        self.unnormalized_tail_dim = unnormalized_tail_dim
         self.register_buffer("_mean", torch.zeros(shape).unsqueeze(0))
         self.register_buffer("_var", torch.ones(shape).unsqueeze(0))
         self.register_buffer("_std", torch.ones(shape).unsqueeze(0))
@@ -45,6 +53,10 @@ class EmpiricalNormalization(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Normalize mean and variance of values based on empirical values."""
+        if self.unnormalized_tail_dim:
+            tail = x[..., -self.unnormalized_tail_dim :]
+            x = x[..., : -self.unnormalized_tail_dim]
+            return torch.cat(((x - self._mean) / (self._std + self.eps), tail), dim=-1)
         return (x - self._mean) / (self._std + self.eps)
 
     @torch.jit.unused
@@ -55,6 +67,8 @@ class EmpiricalNormalization(nn.Module):
         if self.until is not None and self.count >= self.until:
             return
 
+        if self.unnormalized_tail_dim:
+            x = x[..., : -self.unnormalized_tail_dim]
         count_x = x.shape[0]
         self.count += count_x
         rate = count_x / self.count
@@ -68,6 +82,10 @@ class EmpiricalNormalization(nn.Module):
     @torch.jit.unused
     def inverse(self, y: torch.Tensor) -> torch.Tensor:
         """De-normalize values based on empirical values."""
+        if self.unnormalized_tail_dim:
+            tail = y[..., -self.unnormalized_tail_dim :]
+            y = y[..., : -self.unnormalized_tail_dim]
+            return torch.cat((y * (self._std + self.eps) + self._mean, tail), dim=-1)
         return y * (self._std + self.eps) + self._mean
 
 

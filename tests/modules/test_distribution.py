@@ -8,7 +8,12 @@
 import math
 import torch
 
-from rsl_rl.modules.distribution import BetaDistribution, GaussianDistribution, HeteroscedasticGaussianDistribution
+from rsl_rl.modules.distribution import (
+    BetaDistribution,
+    CoefficientGaussianDistribution,
+    GaussianDistribution,
+    HeteroscedasticGaussianDistribution,
+)
 
 
 class TestGaussianDistribution:
@@ -168,6 +173,23 @@ class TestGaussianDistribution:
         dist_fixed.log_prob(sample).sum().backward()
         assert dist_fixed.log_std_param.grad is None, "Non-learnable log std should not receive gradients"
         assert torch.allclose(dist_fixed.log_std_param, torch.log(torch.full((dim,), init_std)), atol=1e-6)
+
+
+class TestCoefficientGaussianDistribution:
+    """Tests for coefficient-conditioned action noise."""
+
+    def test_selects_standard_deviation_by_condition(self) -> None:
+        """Each SAPG coefficient should select its own learnable action std vector."""
+        dist = CoefficientGaussianDistribution(
+            output_dim=2,
+            condition_values=torch.tensor([50.0, 0.0]),
+        )
+        with torch.no_grad():
+            dist.std_param[:] = torch.tensor([[2.0, 3.0], [4.0, 5.0]])
+
+        dist.update(torch.zeros(2, 2), torch.tensor([50.0, 0.0]))
+
+        assert torch.allclose(dist.std, torch.tensor([[2.0, 3.0], [4.0, 5.0]]))
 
 
 class TestHeteroscedasticGaussianDistribution:

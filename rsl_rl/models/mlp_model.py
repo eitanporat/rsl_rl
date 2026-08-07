@@ -58,13 +58,24 @@ class MLPModel(nn.Module):
 
         # Observation normalization
         self.obs_normalization = obs_normalization
+        distribution_cfg = dict(distribution_cfg) if distribution_cfg is not None else None
+        self.extra_info_dim = distribution_cfg.pop("extra_info_dim", 0) if distribution_cfg else 0
         if obs_normalization:
-            self.obs_normalizer = EmpiricalNormalization(self.obs_dim)
+            self.obs_normalizer = EmpiricalNormalization(
+                self.obs_dim - self.extra_info_dim,
+                unnormalized_tail_dim=self.extra_info_dim,
+            )
         else:
             self.obs_normalizer = torch.nn.Identity()
 
         # Distribution
         if distribution_cfg is not None:
+            condition_group = distribution_cfg.get("condition_group")
+            if condition_group is not None:
+                condition_index = distribution_cfg.get("condition_index", -1)
+                distribution_cfg["condition_values"] = torch.unique(
+                    obs[condition_group][..., condition_index]
+                ).detach()
             dist_class: type[Distribution] = resolve_callable(distribution_cfg.pop("class_name"))  # type: ignore
             self.distribution: Distribution | None = dist_class(output_dim, **distribution_cfg)
             mlp_output_dim = self.distribution.input_dim
@@ -102,7 +113,12 @@ class MLPModel(nn.Module):
         # If stochastic output is requested, update the distribution and sample from it, otherwise return MLP output
         if self.distribution is not None:
             if stochastic_output:
-                self.distribution.update(mlp_output)
+                condition_group = getattr(self.distribution, "condition_group", None)
+                if condition_group is None:
+                    self.distribution.update(mlp_output)
+                else:
+                    condition = obs[condition_group][..., self.distribution.condition_index]
+                    self.distribution.update(mlp_output, condition)
                 return self.distribution.sample()
             return self.distribution.deterministic_output(mlp_output)
         return mlp_output

@@ -39,6 +39,16 @@ class TestEmpiricalNormalization:
         expected = (data - norm._mean) / (norm._std + norm.eps)
         assert torch.allclose(result, expected)
 
+    def test_unnormalized_tail_is_preserved(self) -> None:
+        """SAPG coefficient embeddings remain raw while the state prefix is normalized."""
+        norm = EmpiricalNormalization(shape=2, unnormalized_tail_dim=2)
+        norm.train()
+        norm.update(torch.tensor([[10.0, 20.0, 50.0, 50.0], [10.0, 20.0, 0.0, 0.0]]))
+
+        result = norm(torch.tensor([[10.0, 20.0, 50.0, 50.0]]))
+
+        assert torch.allclose(result[..., -2:], torch.tensor([[50.0, 50.0]]))
+
     def test_until_stops_updates(self) -> None:
         """After 'until' samples are seen, further updates must not change statistics."""
         norm = EmpiricalNormalization(shape=2, until=100)
