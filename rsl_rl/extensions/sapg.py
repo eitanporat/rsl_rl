@@ -27,7 +27,7 @@ def _cat_obs(observations: list[TensorDict]) -> TensorDict:
     return TensorDict(
         {
             key: torch.cat([observation[key] for observation in observations], dim=1)
-            for key in observations[0].keys()  # ruff: ignore[in-dict-keys] - TensorDict iteration yields values
+            for key in observations[0]
         },
         batch_size=[observations[0].shape[0], sum(observation.shape[1] for observation in observations)],
     )
@@ -177,8 +177,12 @@ class SAPG(PPO):
 
         repeat_count = min(self.num_blocks, int(self.off_policy_ratio) + 1)
         repeat_idxs = [0]
-        if repeat_count > 1:
+        if repeat_count > 1 and self.gpu_global_rank == 0:
             repeat_idxs += torch.randperm(self.num_blocks - 1, device=self.device)[: repeat_count - 1].add(1).tolist()
+        if self.is_multi_gpu:
+            repeat_payload = [repeat_idxs]
+            torch.distributed.broadcast_object_list(repeat_payload, src=0)
+            repeat_idxs = repeat_payload[0]
         if self.use_others_experience == "none" or len(repeat_idxs) == 1:
             storage.advantages = storage.returns - storage.values
             self._normalize_advantages()
