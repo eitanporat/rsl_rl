@@ -264,17 +264,43 @@ class RolloutStorage:
         """Yield trajectory mini-batches with masks and recurrent hidden states."""
         if self.training_type != "rl":
             raise ValueError("This function is only available for reinforcement learning training.")
-        padded_obs_trajectories, trajectory_masks = split_and_pad_trajectories(self.observations, self.dones)
         mini_batch_size = self.num_envs // num_mini_batches
 
         for ep in range(num_epochs):
+            # Shuffle whole trajectories before each mini-epoch, as rl_games does.
+            # Envs are permuted at the source so the trajectory bookkeeping below
+            # stays consistent with the padded trajectories. Without this the
+            # mini-batches are fixed contiguous env slices, which keeps SAPG's
+            # exploration blocks and its off-policy followers in separate
+            # mini-batches instead of mixing them into every gradient step.
+            perm = torch.randperm(self.num_envs, device=self.dones.device)
+            padded_obs_trajectories, trajectory_masks = split_and_pad_trajectories(
+                self.observations[:, perm], self.dones[:, perm]
+            )
+            actions = self.actions[:, perm]
+            values = self.values[:, perm]
+            advantages = self.advantages[:, perm]
+            returns = self.returns[:, perm]
+            actions_log_prob = self.actions_log_prob[:, perm]
+            distribution_params = tuple(p[:, perm] for p in self.distribution_params)
+            saved_hidden_state_a = (
+                [h[:, :, perm] for h in self.saved_hidden_state_a]
+                if self.saved_hidden_state_a is not None
+                else None
+            )
+            saved_hidden_state_c = (
+                [h[:, :, perm] for h in self.saved_hidden_state_c]
+                if self.saved_hidden_state_c is not None
+                else None
+            )
+
             first_traj = 0
             for i in range(num_mini_batches):
                 # Select the indices for the mini-batch
                 start = i * mini_batch_size
                 stop = (i + 1) * mini_batch_size
 
-                dones = self.dones.squeeze(-1)
+                dones = self.dones[:, perm].squeeze(-1)
                 last_was_done = torch.zeros_like(dones, dtype=torch.bool)
                 last_was_done[1:] = dones[:-1]
                 last_was_done[0] = True
@@ -287,12 +313,12 @@ class RolloutStorage:
                 last_was_done = last_was_done.permute(1, 0)
                 # Take only time steps after dones (flattens num envs and time dimensions),
                 # take a batch of trajectories and finally reshape back to [num_layers, batch, hidden_dim]
-                if self.saved_hidden_state_a is not None:
+                if saved_hidden_state_a is not None:
                     hidden_state_a_batch = [
                         saved_hidden_state.permute(2, 0, 1, 3)[last_was_done][first_traj:last_traj]
                         .transpose(1, 0)
                         .contiguous()
-                        for saved_hidden_state in self.saved_hidden_state_a
+                        for saved_hidden_state in saved_hidden_state_a
                     ]
                     # Remove the tuple for GRU
                     hidden_state_a_batch = (
@@ -300,12 +326,12 @@ class RolloutStorage:
                     )
                 else:
                     hidden_state_a_batch = None
-                if self.saved_hidden_state_c is not None:
+                if saved_hidden_state_c is not None:
                     hidden_state_c_batch = [
                         saved_hidden_state.permute(2, 0, 1, 3)[last_was_done][first_traj:last_traj]
                         .transpose(1, 0)
                         .contiguous()
-                        for saved_hidden_state in self.saved_hidden_state_c
+                        for saved_hidden_state in saved_hidden_state_c
                     ]
                     hidden_state_c_batch = (
                         hidden_state_c_batch[0] if len(hidden_state_c_batch) == 1 else hidden_state_c_batch
@@ -316,12 +342,12 @@ class RolloutStorage:
                 # Yield the mini-batch
                 yield RolloutStorage.Batch(
                     observations=padded_obs_trajectories[:, first_traj:last_traj],  # type: ignore
-                    actions=self.actions[:, start:stop],
-                    values=self.values[:, start:stop],
-                    advantages=self.advantages[:, start:stop],
-                    returns=self.returns[:, start:stop],
-                    old_actions_log_prob=self.actions_log_prob[:, start:stop],
-                    old_distribution_params=tuple(p[:, start:stop] for p in self.distribution_params),  # type: ignore
+                    actions=actions[:, start:stop],
+                    values=values[:, start:stop],
+                    advantages=advantages[:, start:stop],
+                    returns=returns[:, start:stop],
+                    old_actions_log_prob=actions_log_prob[:, start:stop],
+                    old_distribution_params=tuple(p[:, start:stop] for p in distribution_params),  # type: ignore
                     hidden_states=(hidden_state_a_batch, hidden_state_c_batch),  # type: ignore
                     masks=trajectory_masks[:, first_traj:last_traj],
                 )
