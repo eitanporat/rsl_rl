@@ -97,21 +97,22 @@ class PPO:
         self._raw_actor = self.actor
         self._raw_critic = self.critic
 
-        # Create the optimizer. The critic gets its own parameter group so that a
-        # fixed critic_learning_rate can be held constant while the actor's rate
-        # follows the adaptive KL schedule, as an asymmetric central critic does.
+        # Create the optimizer. Only split the critic into its own parameter group
+        # when its rate is pinned, since a second group changes the optimizer
+        # state_dict shape and would stop older checkpoints from loading.
         self.critic_learning_rate = critic_learning_rate
-        self.optimizer = resolve_optimizer(optimizer)(
-            [
+        if critic_learning_rate is None:
+            params = chain(self.actor.parameters(), self.critic.parameters())
+        else:
+            params = [
                 {"params": list(self.actor.parameters()), "name": "actor"},
                 {
                     "params": list(self.critic.parameters()),
                     "name": "critic",
-                    "lr": learning_rate if critic_learning_rate is None else critic_learning_rate,
+                    "lr": critic_learning_rate,
                 },
-            ],
-            lr=learning_rate,
-        )  # type: ignore
+            ]
+        self.optimizer = resolve_optimizer(optimizer)(params, lr=learning_rate)  # type: ignore
 
         # Add storage
         self.storage = storage
