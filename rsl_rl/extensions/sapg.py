@@ -120,7 +120,12 @@ class SAPG(PPO):
                     for start in range(0, flat_observations.shape[0], 8192)
                 ]
             ).reshape(*observations.shape[:2], -1)
-            last = self._denormalize_values(self.critic(last_obs)).detach()
+            last = torch.cat(
+                [
+                    self._denormalize_values(self.critic(last_obs[start : start + 8192])).detach()
+                    for start in range(0, last_obs.shape[0], 8192)
+                ]
+            )
             return values, last
 
         saved_hidden = self.storage.saved_hidden_state_c
