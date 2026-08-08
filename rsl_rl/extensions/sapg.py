@@ -113,7 +113,13 @@ class SAPG(PPO):
         self, observations: TensorDict, last_obs: TensorDict, source: torch.Tensor, last_hidden: HiddenState
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if not self.critic.is_recurrent:
-            values = self._denormalize_values(self.critic(observations)).detach()
+            flat_observations = observations.flatten(0, 1)
+            values = torch.cat(
+                [
+                    self._denormalize_values(self.critic(flat_observations[start : start + 8192])).detach()
+                    for start in range(0, flat_observations.shape[0], 8192)
+                ]
+            ).reshape(*observations.shape[:2], -1)
             last = self._denormalize_values(self.critic(last_obs)).detach()
             return values, last
 
