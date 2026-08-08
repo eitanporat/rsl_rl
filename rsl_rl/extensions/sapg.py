@@ -36,15 +36,15 @@ def _cat_obs(observations: list[TensorDict]) -> TensorDict:
 
 
 def _replace_tail(obs: TensorDict, tail: torch.Tensor, embd_size: int) -> TensorDict:
-    result = obs.clone()
+    values = {}
     for group in ("actor", "critic"):
-        value = result[group]
+        value = obs[group]
         group_tail = tail.to(device=value.device, dtype=value.dtype)
         while group_tail.ndim < value.ndim:
             group_tail = group_tail.unsqueeze(0)
         group_tail = group_tail.expand(*value.shape[:-1], embd_size)
-        result[group] = torch.cat((value[..., :-embd_size], group_tail), dim=-1)
-    return result
+        values[group] = torch.cat((value[..., :-embd_size], group_tail), dim=-1)
+    return TensorDict(values, batch_size=obs.batch_size)
 
 
 def _slice_hidden(hidden: HiddenState, indices: torch.Tensor) -> HiddenState:
