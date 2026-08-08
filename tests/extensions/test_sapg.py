@@ -130,12 +130,14 @@ def test_leader_follower_augmentation_keeps_leader_and_one_follower_block() -> N
         alg.process_env_step(obs, torch.ones(NUM_ENVS), torch.zeros(NUM_ENVS), {})
     original_actions = alg.storage.actions.clone()
     alg.compute_returns(obs)
+    update_storage = alg._update_storage()
 
-    assert alg.storage.num_envs == 6
+    assert alg.storage.num_envs == NUM_ENVS
+    assert update_storage.num_envs == 6
     torch.testing.assert_close(alg.storage.actions[:, :NUM_ENVS], original_actions)
-    torch.testing.assert_close(alg.storage.actions[:, NUM_ENVS:], original_actions[:, :2])
+    torch.testing.assert_close(update_storage.actions[:, NUM_ENVS:], original_actions[:, :2])
     torch.testing.assert_close(
-        alg.storage.observations["actor"][:, NUM_ENVS:, -1],
+        update_storage.observations["actor"][:, NUM_ENVS:, -1],
         torch.zeros(NUM_STEPS, 2),
     )
 
@@ -171,10 +173,11 @@ def test_rollout_to_update_matches_upstream_leader_follower_reference() -> None:
     upstream_returns = torch.stack(rewards) + alg.gamma * (1 - torch.stack(dones)) * next_values
 
     alg.compute_returns(obs)
+    update_storage = alg._update_storage()
 
-    torch.testing.assert_close(alg.storage.observations[:, NUM_ENVS:], follower_obs)
-    torch.testing.assert_close(alg.storage.values[:, NUM_ENVS:], values)
-    torch.testing.assert_close(alg.storage.returns[:, NUM_ENVS:], upstream_returns)
+    torch.testing.assert_close(update_storage.observations[:, NUM_ENVS:], follower_obs)
+    torch.testing.assert_close(update_storage.values[:, NUM_ENVS:], values)
+    torch.testing.assert_close(update_storage.returns[:, NUM_ENVS:], upstream_returns)
     losses = alg.update()
     assert {"aux_value", "entropy", "surrogate", "value"} <= losses.keys()
     assert alg.storage.num_envs == NUM_ENVS

@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+from copy import copy
+
 import torch
 from collections.abc import Generator
 from tensordict import TensorDict
@@ -208,6 +210,12 @@ class RolloutStorage:
     def clear(self) -> None:
         """Reset the write cursor for the next rollout."""
         self.step = 0
+
+    def view(self, **updates: object) -> RolloutStorage:
+        """Return a shallow view with selected fields replaced."""
+        view = copy(self)
+        view.__dict__.update(updates)
+        return view
 
     # For distillation
     def generator(self) -> Generator[Batch, None, None]:

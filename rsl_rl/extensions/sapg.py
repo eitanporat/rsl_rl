@@ -74,36 +74,49 @@ class SAPG(PPO):
             1 if "learn_param" in cfg.get("expl_type", "") else int(cfg.get("expl_reward_coef_embd_size", 32))
         )
         self.scale = float(cfg.get("expl_reward_coef_scale", 0.002))
+        self.expl_reward_type = cfg.get("expl_reward_type", "none")
         self.off_policy_ratio = float(cfg.get("off_policy_ratio", 1.0))
         self.use_others_experience = cfg.get("use_others_experience", "lf")
         self.num_blocks = storage.num_envs // self.block_size
         if storage.num_envs % self.block_size:
             raise ValueError(f"num_envs {storage.num_envs} must be divisible by block size {self.block_size}")
         self.coef_embd = _create_coef_embd(self.num_blocks, self.embd_size, self.device)
+        self.env_coef_embd = self.coef_embd.repeat_interleave(self.block_size, dim=0)
+        self.entropy_coefs = (
+            torch.linspace(0.5, 0.0, self.num_blocks, device=self.device)
+            .repeat_interleave(self.block_size)
+            .mul(self.scale)
+        )
         storage.shuffle_trajectories = True
-        self._original_storage: dict[str, object] | None = None
+        self._update_rollout: RolloutStorage | None = None
 
     def compute_returns(self, obs: TensorDict) -> None:
         """Compute PPO targets and add the mixed-experience follower blocks."""
         last_hidden = self.critic.get_hidden_state() if self.critic.is_recurrent else None
         normalize = self.normalize_advantage_per_mini_batch
         self.normalize_advantage_per_mini_batch = True
-        super().compute_returns(obs)
-        self.normalize_advantage_per_mini_batch = normalize
-        self._augment_storage(obs, last_hidden)
-
-    def update(self) -> dict[str, float]:
-        """Update PPO and restore the unaugmented rollout storage afterward."""
         try:
-            return super().update()
+            super().compute_returns(obs)
         finally:
-            self._restore_storage()
+            self.normalize_advantage_per_mini_batch = normalize
+        self._update_rollout = self._augment_storage(obs, last_hidden)
+
+    def _update_storage(self) -> RolloutStorage:
+        return self._update_rollout or self.storage
+
+    def _after_update(self) -> None:
+        self.storage.clear()
+        self._update_rollout = None
 
     def _entropy_loss(self, entropy: torch.Tensor, batch: RolloutStorage.Batch) -> torch.Tensor:
+        if self.expl_reward_type != "entropy":
+            return super()._entropy_loss(entropy, batch)
         actor_obs = batch.observations["actor"]
         if batch.masks is not None:
             actor_obs = unpad_trajectories(actor_obs, batch.masks)
-        coef = actor_obs[..., -self.embd_size] / 50.0 * (0.5 * self.scale)
+        coefficient = actor_obs[..., -self.embd_size]
+        indices = (coefficient[..., None] == self.coef_embd[:, 0]).long().argmax(-1)
+        coef = self.entropy_coefs[indices]
         while entropy.ndim > coef.ndim:
             entropy = entropy.squeeze(-1)
         return (coef * entropy).mean()
@@ -114,18 +127,8 @@ class SAPG(PPO):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if not self.critic.is_recurrent:
             flat_observations = observations.flatten(0, 1)
-            values = torch.cat(
-                [
-                    self._denormalize_values(self.critic(flat_observations[start : start + 8192])).detach()
-                    for start in range(0, flat_observations.shape[0], 8192)
-                ]
-            ).reshape(*observations.shape[:2], -1)
-            last = torch.cat(
-                [
-                    self._denormalize_values(self.critic(last_obs[start : start + 8192])).detach()
-                    for start in range(0, last_obs.shape[0], 8192)
-                ]
-            )
+            values = self._critic_in_chunks(flat_observations).reshape(*observations.shape[:2], -1)
+            last = self._critic_in_chunks(last_obs)
             return values, last
 
         saved_hidden = self.storage.saved_hidden_state_c
@@ -143,6 +146,16 @@ class SAPG(PPO):
         self.critic.reset(hidden_state=current_hidden)
         return torch.stack(values), last
 
+    def _critic_in_chunks(self, observations: torch.Tensor) -> torch.Tensor:
+        return torch.cat(
+            [
+                self._denormalize_values(
+                    self.critic(observations[start : start + self.block_size])
+                ).detach()
+                for start in range(0, observations.shape[0], self.block_size)
+            ]
+        )
+
     def _targets_for(
         self,
         rewards: torch.Tensor,
@@ -154,26 +167,8 @@ class SAPG(PPO):
         returns = rewards + self.gamma * (1.0 - dones.float()) * next_values
         return returns, returns - values
 
-    def _augment_storage(self, last_obs: TensorDict, last_hidden: HiddenState) -> None:
+    def _augment_storage(self, last_obs: TensorDict, last_hidden: HiddenState) -> RolloutStorage:
         storage = self.storage
-        self._original_storage = {
-            name: getattr(storage, name)
-            for name in (
-                "num_envs",
-                "observations",
-                "actions",
-                "rewards",
-                "dones",
-                "values",
-                "returns",
-                "advantages",
-                "actions_log_prob",
-                "distribution_params",
-                "saved_hidden_state_a",
-                "saved_hidden_state_c",
-            )
-            if hasattr(storage, name)
-        }
         repeat_count = min(self.num_blocks, int(self.off_policy_ratio) + 1)
         repeat_idxs = [0]
         if repeat_count > 1 and self.gpu_global_rank == 0:
@@ -183,9 +178,7 @@ class SAPG(PPO):
             torch.distributed.broadcast_object_list(repeat_payload, src=0)
             repeat_idxs = repeat_payload[0]
         if self.use_others_experience == "none" or len(repeat_idxs) == 1:
-            storage.advantages = storage.returns - storage.values
-            self._normalize_advantages()
-            return
+            return storage.view(advantages=self._normalized_advantages(storage.returns - storage.values))
 
         base_n = storage.num_envs
         source_ids = [
@@ -200,9 +193,9 @@ class SAPG(PPO):
         distribution_parts = [[part] for part in storage.distribution_params]
         hidden_a = [storage.saved_hidden_state_a]
         hidden_c = [storage.saved_hidden_state_c]
+        embedding = self.env_coef_embd
 
         for repeat_idx, source in zip(repeat_idxs[1:], source_ids):
-            embedding = self.coef_embd.repeat_interleave(self.block_size, dim=0)
             tail = torch.roll(embedding, self.block_size * repeat_idx, dims=0)[source]
             follower_obs = _replace_tail(_slice_obs(storage.observations, source, 1), tail, self.embd_size)
             follower_last_obs = _replace_tail(_slice_obs(last_obs, source, 0), tail, self.embd_size)
@@ -228,33 +221,25 @@ class SAPG(PPO):
             if storage.saved_hidden_state_c is not None:
                 hidden_c.append([part[:, :, source] for part in storage.saved_hidden_state_c])
 
-        storage.observations = _cat_obs(observations)
+        updates = {"observations": _cat_obs(observations)}
         for name, parts in tensor_parts.items():
-            setattr(storage, name, torch.cat(parts, dim=1))
-        storage.values = torch.cat(values, dim=1)
-        storage.returns = torch.cat(returns, dim=1)
-        storage.advantages = torch.cat(advantages, dim=1)
-        storage.distribution_params = tuple(torch.cat(parts, dim=1) for parts in distribution_parts)
+            updates[name] = torch.cat(parts, dim=1)
+        updates["values"] = torch.cat(values, dim=1)
+        updates["returns"] = torch.cat(returns, dim=1)
+        updates["advantages"] = torch.cat(advantages, dim=1)
+        updates["distribution_params"] = tuple(torch.cat(parts, dim=1) for parts in distribution_parts)
         if storage.saved_hidden_state_a is not None:
-            storage.saved_hidden_state_a = [torch.cat([part for part in parts], dim=2) for parts in zip(*hidden_a)]
+            updates["saved_hidden_state_a"] = [torch.cat(parts, dim=2) for parts in zip(*hidden_a)]
         if storage.saved_hidden_state_c is not None:
-            storage.saved_hidden_state_c = [torch.cat([part for part in parts], dim=2) for parts in zip(*hidden_c)]
-        storage.num_envs = base_n + len(source_ids) * self.block_size
-        self._normalize_advantages()
+            updates["saved_hidden_state_c"] = [torch.cat(parts, dim=2) for parts in zip(*hidden_c)]
+        updates["num_envs"] = base_n + len(source_ids) * self.block_size
+        updates["advantages"] = self._normalized_advantages(updates["advantages"])
+        return storage.view(**updates)
 
-    def _normalize_advantages(self) -> None:
-        if not self.normalize_advantage_per_mini_batch:
-            self.storage.advantages = (self.storage.advantages - self.storage.advantages.mean()) / (
-                self.storage.advantages.std() + 1e-8
-            )
-
-    def _restore_storage(self) -> None:
-        if self._original_storage is None:
-            return
-        for name, value in self._original_storage.items():
-            setattr(self.storage, name, value)
-        self.storage.clear()
-        self._original_storage = None
+    def _normalized_advantages(self, advantages: torch.Tensor) -> torch.Tensor:
+        if self.normalize_advantage_per_mini_batch:
+            return advantages
+        return (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
 
 __all__ = ["SAPG"]

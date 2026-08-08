@@ -218,12 +218,13 @@ class PPO:
 
     def update(self) -> dict[str, float]:
         """Run optimization epochs over stored batches and return mean losses."""
+        storage = self._update_storage()
         if self.value_normalizer is not None:
             self.value_normalizer.train()
-            self.value_normalizer.update(self.storage.values.reshape(-1, 1))
-            self.storage.values = self._normalize_values(self.storage.values)
-            self.value_normalizer.update(self.storage.returns.reshape(-1, 1))
-            self.storage.returns = self._normalize_values(self.storage.returns)
+            self.value_normalizer.update(storage.values.reshape(-1, 1))
+            storage.values = self._normalize_values(storage.values)
+            self.value_normalizer.update(storage.returns.reshape(-1, 1))
+            storage.returns = self._normalize_values(storage.returns)
             self.value_normalizer.eval()
 
         mean_value_loss = 0
@@ -238,9 +239,9 @@ class PPO:
 
         # Get mini-batch generator
         if self.actor.is_recurrent or self.critic.is_recurrent:
-            generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+            generator = storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         else:
-            generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+            generator = storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
 
         # KL of each mini-batch in the current mini-epoch, for the adaptive schedule.
         epoch_kls: list[torch.Tensor] = []
@@ -427,9 +428,16 @@ class PPO:
             loss_dict["symmetry"] = mean_symmetry_loss
 
         # Clear the storage
-        self.storage.clear()
+        storage.clear()
+        self._after_update()
 
         return loss_dict
+
+    def _update_storage(self) -> RolloutStorage:
+        return self.storage
+
+    def _after_update(self) -> None:
+        pass
 
     def _entropy_loss(self, entropy: torch.Tensor, batch: RolloutStorage.Batch) -> torch.Tensor:
         return self.entropy_coef * entropy.mean()
