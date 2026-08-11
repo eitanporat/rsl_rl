@@ -74,6 +74,7 @@ class MLPModel(nn.Module):
         distribution_cfg: dict | None = None,
         aux_value: bool = False,
         coefficient_embedding_cfg: dict | None = None,
+        rnn_before_mlp: bool = False,
     ) -> None:
         """Initialize the MLP-based model.
 
@@ -89,6 +90,7 @@ class MLPModel(nn.Module):
                 stochastic values sampled from the distribution.
             aux_value: Whether to add a value head sharing the model trunk.
             coefficient_embedding_cfg: Learned scalar-coefficient embedding configuration.
+            rnn_before_mlp: Ignored compatibility flag for shared model configs.
         """
         super().__init__()
 

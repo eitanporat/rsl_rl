@@ -43,6 +43,7 @@ class RNNModel(MLPModel):
         rnn_hidden_dim: int = 256,
         rnn_num_layers: int = 1,
         rnn_layer_norm: bool = False,
+        rnn_before_mlp: bool = False,
     ) -> None:
         """Initialize the RNN-based model.
 
@@ -61,8 +62,10 @@ class RNNModel(MLPModel):
             rnn_hidden_dim: Dimension of the RNN hidden state.
             rnn_num_layers: Number of RNN layers.
             rnn_layer_norm: Whether to normalize recurrent outputs before the MLP.
+            rnn_before_mlp: Whether to run the RNN before the MLP.
         """
         self.latent_dim = rnn_hidden_dim
+        self.rnn_before_mlp = rnn_before_mlp
 
         # Initialize the parent MLP model
         super().__init__(
@@ -88,8 +91,10 @@ class RNNModel(MLPModel):
         """Build the model latent by passing normalized observation groups through the RNN."""
         # Extract and concatenate observation groups and normalize
         latent = super().get_latent(obs)
-        # Pass through the RNN
-        latent = self.rnn(latent, masks, hidden_state).squeeze(0)
+        if self.rnn_before_mlp:
+            latent = self.rnn(latent, masks, hidden_state).squeeze(0)
+        else:
+            latent = self.rnn(latent, masks, hidden_state).squeeze(0)
         return self.rnn_layer_norm(latent)
 
     def reset(self, dones: torch.Tensor | None = None, hidden_state: HiddenState = None) -> None:
