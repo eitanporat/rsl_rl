@@ -218,11 +218,15 @@ class Logger:
 
             # Log rewards and episode length
             if len(self.rewbuffer) > 0:
+                rewards = list(self.rewbuffer)
                 if self.cfg["algorithm"]["rnd_cfg"]:
                     self.writer.add_scalar("Rnd/mean_extrinsic_reward", statistics.mean(self.erewbuffer), it)
                     self.writer.add_scalar("Rnd/mean_intrinsic_reward", statistics.mean(self.irewbuffer), it)
                     self.writer.add_scalar("Rnd/weight", rnd_weight, it)  # type: ignore
-                self.writer.add_scalar("Train/mean_reward", statistics.mean(self.rewbuffer), it)
+                self.writer.add_scalar("Train/mean_reward", statistics.mean(rewards), it)
+                self.writer.add_scalar("Train/min_reward", min(rewards), it)
+                self.writer.add_scalar("Train/max_reward", max(rewards), it)
+                self.writer.add_scalar("Train/std_reward", statistics.pstdev(rewards), it)
                 self.writer.add_scalar("Train/mean_episode_length", statistics.mean(self.lenbuffer), it)
                 if self.logger_type != "WandbLogWriter":
                     self.writer.add_scalar(
