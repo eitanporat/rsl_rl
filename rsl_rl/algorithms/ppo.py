@@ -15,6 +15,7 @@ from rsl_rl.env import VecEnv
 from rsl_rl.extensions import RandomNetworkDistillation, Symmetry, resolve_rnd_config, resolve_symmetry_config
 from rsl_rl.models import MLPModel
 from rsl_rl.modules import RunningMeanStd
+from rsl_rl.optimizers import MuonWithAuxAdamW
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import compile_model, resolve_callable, resolve_obs_groups, resolve_optimizer
 
@@ -101,18 +102,28 @@ class PPO:
         # when its rate is pinned, since a second group changes the optimizer
         # state_dict shape and would stop older checkpoints from loading.
         self.critic_learning_rate = critic_learning_rate
-        if critic_learning_rate is None:
-            params = chain(self.actor.parameters(), self.critic.parameters())
+        if optimizer.lower() == "muon":
+            self.optimizer = MuonWithAuxAdamW((
+                ("actor", self.actor, learning_rate),
+                (
+                    "critic",
+                    self.critic,
+                    critic_learning_rate if critic_learning_rate is not None else learning_rate,
+                ),
+            ))
         else:
-            params = [
-                {"params": list(self.actor.parameters()), "name": "actor"},
-                {
-                    "params": list(self.critic.parameters()),
-                    "name": "critic",
-                    "lr": critic_learning_rate,
-                },
-            ]
-        self.optimizer = resolve_optimizer(optimizer)(params, lr=learning_rate)  # type: ignore
+            if critic_learning_rate is None:
+                params = [*self.actor.parameters(), *self.critic.parameters()]
+            else:
+                params = [
+                    {"params": list(self.actor.parameters()), "name": "actor"},
+                    {
+                        "params": list(self.critic.parameters()),
+                        "name": "critic",
+                        "lr": critic_learning_rate,
+                    },
+                ]
+            self.optimizer = resolve_optimizer(optimizer)(params, lr=learning_rate)  # type: ignore
 
         # Add storage
         self.storage = storage

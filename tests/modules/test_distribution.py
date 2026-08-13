@@ -101,6 +101,64 @@ class TestGaussianDistribution:
         assert mean.grad is not None, "Gradient should flow from log_prob to mean"
         assert not torch.all(mean.grad == 0), "Gradient should be non-zero"
 
+    def test_clipped_sample_and_deterministic_output_respect_range(self) -> None:
+        """A clipped Gaussian should expose exactly the actions that the environment executes."""
+        dist = GaussianDistribution(output_dim=3, init_std=100.0, clip_range=(-1.0, 1.0))
+        mean = torch.tensor([[-5.0, 0.0, 5.0]])
+        dist.update(mean)
+
+        samples = torch.stack([dist.sample() for _ in range(32)])
+        assert torch.all((samples >= -1.0) & (samples <= 1.0))
+        torch.testing.assert_close(dist.deterministic_output(mean), torch.tensor([[-1.0, 0.0, 1.0]]))
+        torch.testing.assert_close(dist.as_deterministic_output_module()(mean), torch.tensor([[-1.0, 0.0, 1.0]]))
+
+    def test_clipped_log_prob_uses_boundary_tail_masses(self) -> None:
+        """Boundary likelihood should integrate each Gaussian tail instead of evaluating a point density."""
+        dist = GaussianDistribution(output_dim=3, init_std=1.0, clip_range=(-1.0, 1.0))
+        dist.update(torch.zeros(1, 3))
+
+        outputs = torch.tensor([[-1.0, 0.0, 1.0]])
+        standard_normal = torch.distributions.Normal(0.0, 1.0)
+        expected = (
+            standard_normal.cdf(torch.tensor(-1.0)).log()
+            + standard_normal.log_prob(torch.tensor(0.0))
+            + (1.0 - standard_normal.cdf(torch.tensor(1.0))).log()
+        )
+        torch.testing.assert_close(dist.log_prob(outputs), expected[None])
+
+    def test_clipped_log_prob_collapses_all_latent_tail_samples(self) -> None:
+        """Every latent value beyond a boundary represents the same executed action and therefore the same mass."""
+        dist = GaussianDistribution(output_dim=1, init_std=2.0, clip_range=(-1.0, 1.0))
+        dist.update(torch.tensor([[0.25]]))
+
+        at_boundary = dist.log_prob(torch.tensor([[1.0]]))
+        far_beyond_boundary = dist.log_prob(torch.tensor([[100.0]]))
+        torch.testing.assert_close(at_boundary, far_beyond_boundary)
+
+    def test_clipped_boundary_log_prob_has_policy_gradient(self) -> None:
+        """CAPG should retain meaningful gradients for saturated actions on both boundaries."""
+        dist = GaussianDistribution(output_dim=2, init_std=1.0, clip_range=(-1.0, 1.0))
+        mean = torch.zeros(1, 2, requires_grad=True)
+        dist.update(mean)
+
+        dist.log_prob(torch.tensor([[-1.0, 1.0]])).backward()
+        assert mean.grad is not None
+        assert mean.grad[0, 0] < 0
+        assert mean.grad[0, 1] > 0
+        assert dist.std_param.grad is not None
+        assert torch.all(dist.std_param.grad > 0)
+
+    def test_clipped_tail_log_prob_is_stable_far_from_boundary(self) -> None:
+        """Tail likelihood and gradients should remain finite where direct CDF calculations underflow."""
+        dist = GaussianDistribution(output_dim=2, init_std=0.1, clip_range=(-1.0, 1.0))
+        mean = torch.tensor([[10.0, -10.0]], requires_grad=True)
+        dist.update(mean)
+
+        log_prob = dist.log_prob(torch.tensor([[-1.0, 1.0]]))
+        log_prob.backward()
+        assert torch.isfinite(log_prob).all()
+        assert mean.grad is not None and torch.isfinite(mean.grad).all()
+
     def test_std_clamped_to_range_scalar(self) -> None:
         """The std should be clamped to both bounds of std_range for std_type='scalar'."""
         dim = 2
@@ -190,6 +248,22 @@ class TestCoefficientGaussianDistribution:
         dist.update(torch.zeros(2, 2), torch.tensor([50.0, 0.0]))
 
         assert torch.allclose(dist.std, torch.tensor([[2.0, 3.0], [4.0, 5.0]]))
+
+    def test_clipping_preserves_checkpoint_parameter_structure(self) -> None:
+        """Enabling CAPG should not add parameters or prevent loading an existing SAPG actor checkpoint."""
+        kwargs = {
+            "output_dim": 2,
+            "condition_values": torch.tensor([50.0, 0.0]),
+            "std_type": "log",
+        }
+        original = CoefficientGaussianDistribution(**kwargs)
+        clipped = CoefficientGaussianDistribution(**kwargs, clip_range=(-1.0, 1.0))
+
+        assert original.state_dict().keys() == clipped.state_dict().keys()
+        clipped.load_state_dict(original.state_dict(), strict=True)
+        clipped.update(torch.zeros(2, 2), torch.tensor([50.0, 0.0]))
+        sample = clipped.sample()
+        assert torch.all((sample >= -1.0) & (sample <= 1.0))
 
 
 class TestHeteroscedasticGaussianDistribution:

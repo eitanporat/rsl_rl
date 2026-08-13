@@ -134,7 +134,9 @@ class GaussianDistribution(Distribution):
 
     This distribution parameterizes stochastic outputs using a multivariate Gaussian with diagonal covariance. The
     standard deviation can be a learnable parameter or a constant. It can be parameterized in either "scalar" space or
-    "log" space and is clamped to a specified range.
+    "log" space and is clamped to a specified range. When ``clip_range`` is set, samples are clipped to that interval
+    and log probabilities describe the resulting mixed distribution: Gaussian density in the interior and Gaussian
+    tail probability mass at each boundary. This is the clipped-action policy-gradient (CAPG) likelihood.
 
     .. note::
         If the standard deviation type is set to "log", the provided arguments are still interpreted in scalar space,
@@ -148,6 +150,7 @@ class GaussianDistribution(Distribution):
         std_range: tuple[float, float] = (1e-6, 1e6),
         std_type: str = "scalar",
         learn_std: bool = True,
+        clip_range: tuple[float, float] | None = None,
     ) -> None:
         """Initialize the Gaussian distribution module.
 
@@ -157,9 +160,14 @@ class GaussianDistribution(Distribution):
             std_range: Range for the standard deviation. Should be a tuple of (min, max) values for clamping.
             std_type: Parameterization of the standard deviation: "scalar" or "log".
             learn_std: Whether the standard deviation should be learnable. If False, it will be fixed to `init_std`.
+            clip_range: Optional inclusive action bounds. If set, samples and deterministic outputs are clipped and
+                boundary log probabilities use Gaussian tail masses rather than point densities.
         """
         super().__init__(output_dim)
         self.std_type = std_type
+        if clip_range is not None and not clip_range[0] < clip_range[1]:
+            raise ValueError(f"clip_range must satisfy low < high, got {clip_range}.")
+        self.clip_range = tuple(float(bound) for bound in clip_range) if clip_range is not None else None
 
         # Learnable std parameters
         if std_type == "scalar":
@@ -192,14 +200,21 @@ class GaussianDistribution(Distribution):
 
     def sample(self) -> torch.Tensor:
         """Sample from the Gaussian distribution."""
-        return self._distribution.sample()  # type: ignore
+        sample = self._distribution.sample()  # type: ignore
+        if self.clip_range is not None:
+            sample = sample.clamp(*self.clip_range)
+        return sample
 
     def deterministic_output(self, mlp_output: torch.Tensor) -> torch.Tensor:
         """Extract the mean from the MLP output."""
+        if self.clip_range is not None:
+            return mlp_output.clamp(*self.clip_range)
         return mlp_output
 
     def as_deterministic_output_module(self) -> nn.Module:
         """Return an export-friendly module that extracts the mean from the MLP output."""
+        if self.clip_range is not None:
+            return _ClampedDeterministicOutput(*self.clip_range)
         return _IdentityDeterministicOutput()
 
     @property
@@ -219,7 +234,12 @@ class GaussianDistribution(Distribution):
 
     @property
     def entropy(self) -> torch.Tensor:
-        """Return the entropy of the Gaussian distribution, summed over the last dimension."""
+        """Return latent Gaussian entropy, summed over the last dimension.
+
+        For a clipped distribution this intentionally remains the entropy of the latent Gaussian. The clipped
+        distribution mixes continuous density with boundary atoms, so it has no single differential entropy. Callers
+        may use this value as an exploration diagnostic, but should not interpret it as executed-action entropy.
+        """
         return self._distribution.entropy().sum(dim=-1)  # type: ignore
 
     @property
@@ -228,8 +248,29 @@ class GaussianDistribution(Distribution):
         return (self.mean, self.std)
 
     def log_prob(self, outputs: torch.Tensor) -> torch.Tensor:
-        """Compute the log probability under the Gaussian, summed over the last dimension."""
-        return self._distribution.log_prob(outputs).sum(dim=-1)  # type: ignore
+        """Compute output log probability, using tail masses for clipped boundary actions."""
+        if self.clip_range is None:
+            return self._distribution.log_prob(outputs).sum(dim=-1)  # type: ignore
+
+        # log_ndtr is stable in Gaussian tails, unlike log(cdf(x)) or log1p(-cdf(x)). Keep the calculation in at least
+        # float32 under mixed precision; policy likelihoods are particularly sensitive to underflow here.
+        mean = self.mean
+        std = self.std
+        calc_dtype = torch.float32 if mean.dtype in (torch.float16, torch.bfloat16) else mean.dtype
+        outputs = outputs.to(calc_dtype)
+        mean = mean.to(calc_dtype)
+        std = std.to(calc_dtype)
+        low, high = self.clip_range
+
+        interior_log_prob = Normal(mean, std).log_prob(outputs)
+        lower_log_mass = torch.special.log_ndtr((low - mean) / std)
+        upper_log_mass = torch.special.log_ndtr((mean - high) / std)
+        component_log_prob = torch.where(
+            outputs <= low,
+            lower_log_mass,
+            torch.where(outputs >= high, upper_log_mass, interior_log_prob),
+        )
+        return component_log_prob.sum(dim=-1)
 
     def kl_divergence(self, old_params: tuple[torch.Tensor, ...], new_params: tuple[torch.Tensor, ...]) -> torch.Tensor:
         """Compute KL(old || new) between two Gaussian distributions."""
@@ -251,9 +292,10 @@ class CoefficientGaussianDistribution(GaussianDistribution):
         std_range: tuple[float, float] = (1e-6, 1e6),
         std_type: str = "scalar",
         learn_std: bool = True,
+        clip_range: tuple[float, float] | None = None,
     ) -> None:
         """Initialize per-coefficient standard deviations."""
-        super().__init__(output_dim, init_std, std_range, std_type, learn_std)
+        super().__init__(output_dim, init_std, std_range, std_type, learn_std, clip_range)
         self.condition_group = condition_group
         self.condition_index = condition_index
         self.register_buffer("condition_values", condition_values.detach().clone().flatten())
@@ -482,6 +524,18 @@ class _FirstSliceDeterministicOutput(nn.Module):
 
     def forward(self, mlp_output: torch.Tensor) -> torch.Tensor:
         return mlp_output[..., 0, :]
+
+
+class _ClampedDeterministicOutput(nn.Module):
+    """Exportable module that clips a Gaussian mean to the executed action range."""
+
+    def __init__(self, low: float, high: float) -> None:
+        super().__init__()
+        self.low = low
+        self.high = high
+
+    def forward(self, mlp_output: torch.Tensor) -> torch.Tensor:
+        return mlp_output.clamp(self.low, self.high)
 
 
 class _BetaDeterministicOutput(nn.Module):

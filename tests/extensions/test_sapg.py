@@ -39,6 +39,7 @@ def _make_sapg() -> tuple[SAPG, TensorDict]:
             "condition_index": -1,
             "extra_info_dim": 1,
             "std_type": "log",
+            "clip_range": (-1.0, 1.0),
         },
     )
     critic = MLPModel(
@@ -126,7 +127,8 @@ def test_leader_follower_augmentation_keeps_leader_and_one_follower_block() -> N
     """Leader/follower filtering retains all leaders and one source block."""
     alg, obs = _make_sapg()
     for _ in range(NUM_STEPS):
-        alg.act(obs)
+        actions = alg.act(obs)
+        assert torch.all((actions >= -1.0) & (actions <= 1.0))
         alg.process_env_step(obs, torch.ones(NUM_ENVS), torch.zeros(NUM_ENVS), {})
     original_actions = alg.storage.actions.clone()
     alg.compute_returns(obs)
