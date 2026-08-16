@@ -109,7 +109,7 @@ class OnPolicyRunner:
 
             stop = time.time()
             learn_time = stop - start
-            self.current_learning_iteration = it
+            self.current_learning_iteration = it + 1
 
             # Log information
             self.logger.log(

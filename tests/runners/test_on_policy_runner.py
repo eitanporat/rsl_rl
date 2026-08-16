@@ -169,7 +169,7 @@ class TestLearnLoop:
         """current_learning_iteration should reflect completed iterations."""
         runner = _build_runner()
         runner.learn(num_learning_iterations=3)
-        assert runner.current_learning_iteration == 2
+        assert runner.current_learning_iteration == 3
 
 
 class TestSaveLoad:
