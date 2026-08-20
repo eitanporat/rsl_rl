@@ -3,16 +3,17 @@
 import torch
 from tensordict import TensorDict
 
-from rsl_rl.extensions.sapg import SAPG
+from rsl_rl.extensions.sapg import SAPG, sapg_coefficients
 from rsl_rl.models import MLPModel, RNNModel
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import split_and_pad_trajectories
 
-NUM_ENVS, NUM_STEPS, NUM_ACTIONS = 4, 2, 2
+NUM_ENVS, NUM_STEPS, NUM_ACTIONS = 5, 2, 2
+SOURCE_IDS = torch.tensor([0, 2, 4])
 
 
 def _make_sapg() -> tuple[SAPG, TensorDict]:
-    coefficient = torch.tensor([10.0, 10.0, 0.0, 0.0])[:, None]
+    coefficient = sapg_coefficients(NUM_ENVS, 2, 10.0, "cpu")
     obs = TensorDict(
         {
             "actor": torch.cat((torch.randn(NUM_ENVS, 3), coefficient), -1),
@@ -64,7 +65,7 @@ def _make_sapg() -> tuple[SAPG, TensorDict]:
         num_learning_epochs=1,
         num_mini_batches=1,
         sapg_cfg={
-            "expl_coef_block_size": 2,
+            "num_exploration_coefficients": 2,
             "expl_coef_max": 10.0,
             "expl_reward_coef_embd_size": 32,
             "expl_reward_coef_scale": 0.002,
@@ -82,6 +83,12 @@ def test_learned_parameter_uses_scalar_coefficient() -> None:
     alg, _ = _make_sapg()
     assert alg.embd_size == 1
     torch.testing.assert_close(alg.coef_embd, torch.tensor([[10.0], [0.0]]))
+    torch.testing.assert_close(alg.entropy_coefs, torch.tensor([0.001, 0.0]))
+
+
+def test_single_environment_uses_zero_exploration() -> None:
+    """A one-environment debug run remains valid without an exploratory peer."""
+    torch.testing.assert_close(sapg_coefficients(1, 6, 50.0, "cpu"), torch.zeros(1, 1))
 
 
 def test_network_inputs_match_upstream_learned_parameter_expansion() -> None:
@@ -102,7 +109,7 @@ def test_network_inputs_match_upstream_learned_parameter_expansion() -> None:
     alg.actor(obs, stochastic_output=True)
     torch.testing.assert_close(
         alg.actor.output_std,
-        torch.tensor([[2.0], [2.0], [3.0], [3.0]]).expand(-1, NUM_ACTIONS),
+        torch.tensor([[2.0], [3.0], [2.0], [3.0], [2.0]]).expand(-1, NUM_ACTIONS),
     )
     exported = torch.jit.script(alg.actor.as_jit())
     torch.testing.assert_close(exported(obs["actor"]), alg.actor(obs))
@@ -136,12 +143,12 @@ def test_leader_follower_augmentation_keeps_leader_and_one_follower_block() -> N
     update_storage = alg._update_storage()
 
     assert alg.storage.num_envs == NUM_ENVS
-    assert update_storage.num_envs == 6
+    assert update_storage.num_envs == 8
     torch.testing.assert_close(alg.storage.actions[:, :NUM_ENVS], original_actions)
-    torch.testing.assert_close(update_storage.actions[:, NUM_ENVS:], original_actions[:, :2])
+    torch.testing.assert_close(update_storage.actions[:, NUM_ENVS:], original_actions[:, SOURCE_IDS])
     torch.testing.assert_close(
         update_storage.observations["actor"][:, NUM_ENVS:, -1],
-        torch.zeros(NUM_STEPS, 2),
+        torch.zeros(NUM_STEPS, len(SOURCE_IDS)),
     )
 
 
@@ -156,17 +163,17 @@ def test_rollout_to_update_matches_upstream_leader_follower_reference() -> None:
         reward = torch.arange(NUM_ENVS, dtype=torch.float32) + step
         done = torch.zeros(NUM_ENVS)
         done[1] = step
-        rewards.append(reward[:2, None])
-        dones.append(done[:2, None])
+        rewards.append(reward[SOURCE_IDS, None])
+        dones.append(done[SOURCE_IDS, None])
         obs = obs.clone()
         obs["actor"][:, :-1] += 0.1
         obs["critic"][:, :-1] += 0.2
         alg.process_env_step(obs, reward, done, {})
 
-    follower_obs = alg.storage.observations[:, :2].clone()
+    follower_obs = alg.storage.observations[:, SOURCE_IDS].clone()
     follower_obs["actor"][:, :, -1] = 0
     follower_obs["critic"][:, :, -1] = 0
-    follower_last = obs[:2].clone()
+    follower_last = obs[SOURCE_IDS].clone()
     follower_last["actor"][:, -1] = 0
     follower_last["critic"][:, -1] = 0
     with torch.no_grad():
