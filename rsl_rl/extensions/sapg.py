@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 import torch
+from math import ceil
 from tensordict import TensorDict
+from typing import Any
 
 from rsl_rl.algorithms.ppo import PPO
 from rsl_rl.models import MLPModel
@@ -15,12 +15,27 @@ from rsl_rl.utils import unpad_trajectories
 
 
 def _create_coef_embd(
-    num_blocks: int,
+    count: int,
     embd_size: int,
     maximum: float,
     device: str,
 ) -> torch.Tensor:
-    return torch.linspace(maximum, 0.0, num_blocks, device=device)[:, None].repeat(1, embd_size)
+    return torch.linspace(maximum, 0.0, count, device=device)[:, None].repeat(1, embd_size)
+
+
+def sapg_coefficients(
+    num_envs: int,
+    count: int,
+    maximum: float,
+    device: str | torch.device,
+) -> torch.Tensor:
+    """Assign fixed SAPG coefficient levels evenly across any environment count."""
+    if count < 2:
+        raise ValueError("SAPG requires at least two coefficient levels")
+    if num_envs < count:
+        raise ValueError(f"num_envs {num_envs} must be at least coefficient count {count}")
+    levels = torch.linspace(maximum, 0.0, count, device=device)
+    return levels[torch.arange(num_envs, device=device) % count, None]
 
 
 def _slice_obs(obs: TensorDict, indices: torch.Tensor, dim: int) -> TensorDict:
@@ -34,7 +49,7 @@ def _cat_obs(observations: list[TensorDict]) -> TensorDict:
     return TensorDict(
         {
             key: torch.cat([observation[key] for observation in observations], dim=1)
-            for key in observations[0].keys()  # ruff: ignore[SIM118] - TensorDict iteration yields values
+            for key in observations[0].keys()  # noqa: SIM118 - TensorDict iteration yields values
         },
         batch_size=[observations[0].shape[0], sum(observation.shape[1] for observation in observations)],
     )
@@ -74,7 +89,6 @@ class SAPG(PPO):
         """Initialize PPO with SAPG rollout configuration."""
         super().__init__(actor, critic, storage, **kwargs)
         cfg = sapg_cfg or {}
-        self.block_size = int(cfg.get("expl_coef_block_size", 4096))
         self.coefficient_max = float(cfg.get("expl_coef_max", 50.0))
         self.embd_size = (
             1 if "learn_param" in cfg.get("expl_type", "") else int(cfg.get("expl_reward_coef_embd_size", 32))
@@ -83,21 +97,29 @@ class SAPG(PPO):
         self.expl_reward_type = cfg.get("expl_reward_type", "none")
         self.off_policy_ratio = float(cfg.get("off_policy_ratio", 1.0))
         self.use_others_experience = cfg.get("use_others_experience", "lf")
-        self.num_blocks = storage.num_envs // self.block_size
-        if storage.num_envs % self.block_size:
-            raise ValueError(f"num_envs {storage.num_envs} must be divisible by block size {self.block_size}")
+        count = cfg.get("num_exploration_coefficients")
+        if count is None:
+            block_size = int(cfg.get("expl_coef_block_size", 4096))
+            if storage.num_envs % block_size:
+                raise ValueError(f"num_envs {storage.num_envs} must be divisible by block size {block_size}")
+            count = storage.num_envs // block_size
+        self.num_coefficients = int(count)
+        coefficients = sapg_coefficients(
+            storage.num_envs,
+            self.num_coefficients,
+            self.coefficient_max,
+            self.device,
+        )
         self.coef_embd = _create_coef_embd(
-            self.num_blocks,
+            self.num_coefficients,
             self.embd_size,
             self.coefficient_max,
             self.device,
         )
-        self.env_coef_embd = self.coef_embd.repeat_interleave(self.block_size, dim=0)
-        self.entropy_coefs = (
-            torch.linspace(0.5, 0.0, self.num_blocks, device=self.device)
-            .repeat_interleave(self.block_size)
-            .mul(self.scale)
-        )
+        self.coefficient_ids = torch.arange(storage.num_envs, device=self.device) % self.num_coefficients
+        self.env_coef_embd = coefficients.repeat(1, self.embd_size)
+        self.entropy_coefs = torch.linspace(0.5, 0.0, self.num_coefficients, device=self.device).mul(self.scale)
+        self.critic_batch_size = ceil(storage.num_envs / self.num_coefficients)
         storage.shuffle_trajectories = True
         self._update_rollout: RolloutStorage | None = None
 
@@ -158,14 +180,10 @@ class SAPG(PPO):
         return torch.stack(values), last
 
     def _critic_in_chunks(self, observations: torch.Tensor) -> torch.Tensor:
-        return torch.cat(
-            [
-                self._denormalize_values(
-                    self.critic(observations[start : start + self.block_size])
-                ).detach()
-                for start in range(0, observations.shape[0], self.block_size)
-            ]
-        )
+        return torch.cat([
+            self._denormalize_values(self.critic(observations[start : start + self.critic_batch_size])).detach()
+            for start in range(0, observations.shape[0], self.critic_batch_size)
+        ])
 
     def _targets_for(
         self,
@@ -180,22 +198,19 @@ class SAPG(PPO):
 
     def _augment_storage(self, last_obs: TensorDict, last_hidden: HiddenState) -> RolloutStorage:
         storage = self.storage
-        repeat_count = min(self.num_blocks, int(self.off_policy_ratio) + 1)
-        repeat_idxs = [0]
-        if repeat_count > 1 and self.gpu_global_rank == 0:
-            repeat_idxs += torch.randperm(self.num_blocks - 1, device=self.device)[: repeat_count - 1].add(1).tolist()
+        source_groups = []
+        repeat_count = min(self.num_coefficients - 1, int(self.off_policy_ratio))
+        if repeat_count and self.gpu_global_rank == 0:
+            source_groups = torch.randperm(self.num_coefficients - 1, device=self.device)[:repeat_count].tolist()
         if self.is_multi_gpu:
-            repeat_payload = [repeat_idxs]
+            repeat_payload = [source_groups]
             torch.distributed.broadcast_object_list(repeat_payload, src=0)
-            repeat_idxs = repeat_payload[0]
-        if self.use_others_experience == "none" or len(repeat_idxs) == 1:
+            source_groups = repeat_payload[0]
+        if self.use_others_experience == "none" or not source_groups:
             return storage.view(advantages=self._normalized_advantages(storage.returns - storage.values))
 
         base_n = storage.num_envs
-        source_ids = [
-            torch.arange((repeat_idx - 1) * self.block_size, repeat_idx * self.block_size, device=self.device)
-            for repeat_idx in repeat_idxs[1:]
-        ]
+        source_ids = [(self.coefficient_ids == group).nonzero(as_tuple=False).flatten() for group in source_groups]
         observations = [storage.observations]
         values = [storage.values]
         returns = [storage.returns]
@@ -204,10 +219,9 @@ class SAPG(PPO):
         distribution_parts = [[part] for part in storage.distribution_params]
         hidden_a = [storage.saved_hidden_state_a]
         hidden_c = [storage.saved_hidden_state_c]
-        embedding = self.env_coef_embd
 
-        for repeat_idx, source in zip(repeat_idxs[1:], source_ids):
-            tail = torch.roll(embedding, self.block_size * repeat_idx, dims=0)[source]
+        for source in source_ids:
+            tail = self.coef_embd[-1].expand(len(source), -1)
             follower_obs = _replace_tail(_slice_obs(storage.observations, source, 1), tail, self.embd_size)
             follower_last_obs = _replace_tail(_slice_obs(last_obs, source, 0), tail, self.embd_size)
             follower_values, follower_last_values = self._values_for(
@@ -243,7 +257,7 @@ class SAPG(PPO):
             updates["saved_hidden_state_a"] = [torch.cat(parts, dim=2) for parts in zip(*hidden_a)]
         if storage.saved_hidden_state_c is not None:
             updates["saved_hidden_state_c"] = [torch.cat(parts, dim=2) for parts in zip(*hidden_c)]
-        updates["num_envs"] = base_n + len(source_ids) * self.block_size
+        updates["num_envs"] = base_n + sum(len(source) for source in source_ids)
         updates["advantages"] = self._normalized_advantages(updates["advantages"])
         return storage.view(**updates)
 
@@ -253,4 +267,4 @@ class SAPG(PPO):
         return (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
 
-__all__ = ["SAPG"]
+__all__ = ["SAPG", "sapg_coefficients"]
