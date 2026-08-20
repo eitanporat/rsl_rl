@@ -14,13 +14,18 @@ from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import unpad_trajectories
 
 
-def _create_coef_embd(
+def _coefficient_levels(
+    num_envs: int,
     count: int,
-    embd_size: int,
     maximum: float,
-    device: str,
+    device: str | torch.device,
 ) -> torch.Tensor:
-    return torch.linspace(maximum, 0.0, count, device=device)[:, None].repeat(1, embd_size)
+    if num_envs < 1 or count < 1:
+        raise ValueError("SAPG requires positive environment and coefficient counts")
+    active_count = min(num_envs, count)
+    if active_count == 1:
+        return torch.zeros(1, device=device)
+    return torch.linspace(maximum, 0.0, active_count, device=device)
 
 
 def sapg_coefficients(
@@ -30,12 +35,8 @@ def sapg_coefficients(
     device: str | torch.device,
 ) -> torch.Tensor:
     """Assign fixed SAPG coefficient levels evenly across any environment count."""
-    if count < 2:
-        raise ValueError("SAPG requires at least two coefficient levels")
-    if num_envs < count:
-        raise ValueError(f"num_envs {num_envs} must be at least coefficient count {count}")
-    levels = torch.linspace(maximum, 0.0, count, device=device)
-    return levels[torch.arange(num_envs, device=device) % count, None]
+    levels = _coefficient_levels(num_envs, count, maximum, device)
+    return levels[torch.arange(num_envs, device=device) % len(levels), None]
 
 
 def _slice_obs(obs: TensorDict, indices: torch.Tensor, dim: int) -> TensorDict:
@@ -103,22 +104,28 @@ class SAPG(PPO):
             if storage.num_envs % block_size:
                 raise ValueError(f"num_envs {storage.num_envs} must be divisible by block size {block_size}")
             count = storage.num_envs // block_size
-        self.num_coefficients = int(count)
+        configured_count = int(count)
         coefficients = sapg_coefficients(
             storage.num_envs,
-            self.num_coefficients,
+            configured_count,
             self.coefficient_max,
             self.device,
         )
-        self.coef_embd = _create_coef_embd(
-            self.num_coefficients,
-            self.embd_size,
+        levels = _coefficient_levels(
+            storage.num_envs,
+            configured_count,
             self.coefficient_max,
             self.device,
         )
+        self.num_coefficients = len(levels)
+        self.coef_embd = levels[:, None].repeat(1, self.embd_size)
         self.coefficient_ids = torch.arange(storage.num_envs, device=self.device) % self.num_coefficients
         self.env_coef_embd = coefficients.repeat(1, self.embd_size)
-        self.entropy_coefs = torch.linspace(0.5, 0.0, self.num_coefficients, device=self.device).mul(self.scale)
+        self.entropy_coefs = (
+            torch.zeros(1, device=self.device)
+            if self.num_coefficients == 1
+            else torch.linspace(0.5, 0.0, self.num_coefficients, device=self.device).mul(self.scale)
+        )
         self.critic_batch_size = ceil(storage.num_envs / self.num_coefficients)
         storage.shuffle_trajectories = True
         self._update_rollout: RolloutStorage | None = None

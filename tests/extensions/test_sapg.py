@@ -86,6 +86,10 @@ def test_learned_parameter_uses_scalar_coefficient() -> None:
     torch.testing.assert_close(alg.entropy_coefs, torch.tensor([0.001, 0.0]))
 
 
+def test_single_environment_uses_zero_exploration() -> None:
+    torch.testing.assert_close(sapg_coefficients(1, 6, 50.0, "cpu"), torch.zeros(1, 1))
+
+
 def test_network_inputs_match_upstream_learned_parameter_expansion() -> None:
     """Actor and critic replace the scalar with their own learned 32-vector."""
     alg, obs = _make_sapg()
