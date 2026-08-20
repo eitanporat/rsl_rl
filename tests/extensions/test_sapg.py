@@ -87,6 +87,7 @@ def test_learned_parameter_uses_scalar_coefficient() -> None:
 
 
 def test_single_environment_uses_zero_exploration() -> None:
+    """A one-environment debug run remains valid without an exploratory peer."""
     torch.testing.assert_close(sapg_coefficients(1, 6, 50.0, "cpu"), torch.zeros(1, 1))
 
 
