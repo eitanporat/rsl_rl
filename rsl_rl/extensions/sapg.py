@@ -89,6 +89,7 @@ class SAPG(PPO):
     ) -> None:
         """Initialize PPO with SAPG rollout configuration."""
         super().__init__(actor, critic, storage, **kwargs)
+        self.num_mini_batches = min(self.num_mini_batches, storage.num_envs)
         cfg = sapg_cfg or {}
         self.coefficient_max = float(cfg.get("expl_coef_max", 50.0))
         self.embd_size = (

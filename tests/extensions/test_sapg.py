@@ -12,14 +12,14 @@ NUM_ENVS, NUM_STEPS, NUM_ACTIONS = 5, 2, 2
 SOURCE_IDS = torch.tensor([0, 2, 4])
 
 
-def _make_sapg() -> tuple[SAPG, TensorDict]:
-    coefficient = sapg_coefficients(NUM_ENVS, 2, 10.0, "cpu")
+def _make_sapg(num_envs: int = NUM_ENVS) -> tuple[SAPG, TensorDict]:
+    coefficient = sapg_coefficients(num_envs, 2, 10.0, "cpu")
     obs = TensorDict(
         {
-            "actor": torch.cat((torch.randn(NUM_ENVS, 3), coefficient), -1),
-            "critic": torch.cat((torch.randn(NUM_ENVS, 4), coefficient), -1),
+            "actor": torch.cat((torch.randn(num_envs, 3), coefficient), -1),
+            "critic": torch.cat((torch.randn(num_envs, 4), coefficient), -1),
         },
-        batch_size=[NUM_ENVS],
+        batch_size=[num_envs],
     )
     groups = {"actor": ["actor"], "critic": ["critic"]}
     actor = MLPModel(
@@ -55,7 +55,7 @@ def _make_sapg() -> tuple[SAPG, TensorDict]:
             "embedding_dim": 32,
         },
     )
-    storage = RolloutStorage("rl", NUM_ENVS, NUM_STEPS, obs, [NUM_ACTIONS])
+    storage = RolloutStorage("rl", num_envs, NUM_STEPS, obs, [NUM_ACTIONS])
     alg = SAPG(
         actor,
         critic,
@@ -89,6 +89,8 @@ def test_learned_parameter_uses_scalar_coefficient() -> None:
 def test_single_environment_uses_zero_exploration() -> None:
     """A one-environment debug run remains valid without an exploratory peer."""
     torch.testing.assert_close(sapg_coefficients(1, 6, 50.0, "cpu"), torch.zeros(1, 1))
+    algorithm, _ = _make_sapg(num_envs=1)
+    assert algorithm.num_mini_batches == 1
 
 
 def test_network_inputs_match_upstream_learned_parameter_expansion() -> None:
