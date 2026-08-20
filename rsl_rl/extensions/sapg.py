@@ -14,8 +14,13 @@ from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import unpad_trajectories
 
 
-def _create_coef_embd(num_blocks: int, embd_size: int, device: str) -> torch.Tensor:
-    return torch.linspace(50.0, 0.0, num_blocks, device=device)[:, None].repeat(1, embd_size)
+def _create_coef_embd(
+    num_blocks: int,
+    embd_size: int,
+    maximum: float,
+    device: str,
+) -> torch.Tensor:
+    return torch.linspace(maximum, 0.0, num_blocks, device=device)[:, None].repeat(1, embd_size)
 
 
 def _slice_obs(obs: TensorDict, indices: torch.Tensor, dim: int) -> TensorDict:
@@ -70,6 +75,7 @@ class SAPG(PPO):
         super().__init__(actor, critic, storage, **kwargs)
         cfg = sapg_cfg or {}
         self.block_size = int(cfg.get("expl_coef_block_size", 4096))
+        self.coefficient_max = float(cfg.get("expl_coef_max", 50.0))
         self.embd_size = (
             1 if "learn_param" in cfg.get("expl_type", "") else int(cfg.get("expl_reward_coef_embd_size", 32))
         )
@@ -80,7 +86,12 @@ class SAPG(PPO):
         self.num_blocks = storage.num_envs // self.block_size
         if storage.num_envs % self.block_size:
             raise ValueError(f"num_envs {storage.num_envs} must be divisible by block size {self.block_size}")
-        self.coef_embd = _create_coef_embd(self.num_blocks, self.embd_size, self.device)
+        self.coef_embd = _create_coef_embd(
+            self.num_blocks,
+            self.embd_size,
+            self.coefficient_max,
+            self.device,
+        )
         self.env_coef_embd = self.coef_embd.repeat_interleave(self.block_size, dim=0)
         self.entropy_coefs = (
             torch.linspace(0.5, 0.0, self.num_blocks, device=self.device)

@@ -12,7 +12,7 @@ NUM_ENVS, NUM_STEPS, NUM_ACTIONS = 4, 2, 2
 
 
 def _make_sapg() -> tuple[SAPG, TensorDict]:
-    coefficient = torch.tensor([50.0, 50.0, 0.0, 0.0])[:, None]
+    coefficient = torch.tensor([10.0, 10.0, 0.0, 0.0])[:, None]
     obs = TensorDict(
         {
             "actor": torch.cat((torch.randn(NUM_ENVS, 3), coefficient), -1),
@@ -65,6 +65,7 @@ def _make_sapg() -> tuple[SAPG, TensorDict]:
         num_mini_batches=1,
         sapg_cfg={
             "expl_coef_block_size": 2,
+            "expl_coef_max": 10.0,
             "expl_reward_coef_embd_size": 32,
             "expl_reward_coef_scale": 0.002,
             "expl_type": "mixed_expl_learn_param",
@@ -80,7 +81,7 @@ def test_learned_parameter_uses_scalar_coefficient() -> None:
     """Learn-param SAPG exposes one scalar coefficient per environment."""
     alg, _ = _make_sapg()
     assert alg.embd_size == 1
-    torch.testing.assert_close(alg.coef_embd, torch.tensor([[50.0], [0.0]]))
+    torch.testing.assert_close(alg.coef_embd, torch.tensor([[10.0], [0.0]]))
 
 
 def test_network_inputs_match_upstream_learned_parameter_expansion() -> None:
@@ -95,7 +96,7 @@ def test_network_inputs_match_upstream_learned_parameter_expansion() -> None:
         torch.testing.assert_close(model.get_latent(obs), upstream)
         assert model.input_dim == base_dim + 32
 
-    for value, std in ((50, 2), (0, 3)):
+    for value, std in ((10, 2), (0, 3)):
         row = (alg.actor.distribution.condition_values == value).nonzero().item()
         alg.actor.distribution.log_std_param.data[row].fill_(torch.log(torch.tensor(std)))
     alg.actor(obs, stochastic_output=True)

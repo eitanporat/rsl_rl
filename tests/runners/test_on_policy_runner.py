@@ -168,8 +168,11 @@ class TestLearnLoop:
     def test_learn_advances_iteration_counter(self) -> None:
         """current_learning_iteration should reflect completed iterations."""
         runner = _build_runner()
+        completed = []
+        runner.iteration_callback = lambda iteration, _final: completed.append(iteration)
         runner.learn(num_learning_iterations=3)
-        assert runner.current_learning_iteration == 2
+        assert runner.current_learning_iteration == 3
+        assert completed == [1, 2, 3]
 
 
 class TestSaveLoad:
